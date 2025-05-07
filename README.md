@@ -73,7 +73,7 @@ Zeffy offers a substantial upgrade in functionality and design compared to typic
 
 1.  **Clone the Repository (if applicable)**
     ```bash
-    # git clone <repository_url>
+    # git clone [<repository_url>](https://github.com/zulqarnainalipk/Zeffy.git)
     # cd zeffy-automl-pipeline
     ```
     (If Zeffy is distributed as a package, this step might be different, e.g., direct pip install from PyPI or a wheel file.)
@@ -388,7 +388,7 @@ if __name__ == "__main__":
     print("\nZeffy Advanced Regression Example Finished.")
 ```
 
-### 4.3. Using Pretrained Models (Conceptual)
+### 4.3. Using Pretrained Models 
 
 Zeffy's PyTorch integration allows for loading pretrained model weights.
 
@@ -466,7 +466,7 @@ Zeffy is configured using a YAML or JSON file. The main sections of the configur
     *   `method` (str): "shap" or "lime".
     *   `shap_explainer_params` (object): Parameters for the SHAP explainer.
 
-(Detailed schema for each configuration object will be maintained, possibly with JSON schemas or Pydantic model exports.)
+(Detailed schema for each configuration object will be maintained,  with JSON schemas or Pydantic model exports.)
 
 ## 6. Error Handling
 
@@ -563,7 +563,7 @@ Zeffy can be applied to a wide variety of machine learning tasks, including but 
 
 ## 10. Contributing
 
-just open  an issue and start contributing 
+just open an issue and start contributing 
 
 ## 11. License
 
