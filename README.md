@@ -559,23 +559,13 @@ Zeffy can be applied to a wide variety of machine learning tasks, including but 
 *   **Rapid prototyping and benchmarking** of different modeling approaches.
 *   **Educational purposes** for learning about AutoML pipeline components.
 
-## 10. Future Development (Roadmap - Conceptual)
 
-*   Full implementation of all planned preprocessing and feature engineering modules.
-*   Expanded HPO library support (Hyperopt, Ray Tune).
-*   Advanced ensembling strategies (e.g., more sophisticated stacking, blending options).
-*   GUI or Web Interface for pipeline configuration and monitoring.
-*   Integration with MLOps tools (e.g., MLflow for experiment tracking).
-*   Support for distributed training (Dask, Ray).
-*   More comprehensive data loaders (SQL databases, cloud storage).
-*   Automated report generation with visualizations.
-*   Enhanced time-series specific components.
 
-## 11. Contributing
+## 10. Contributing
 
 just open  an issue and start contributing 
 
-## 12. License
+## 11. License
 
 (Specify the license under which Zeffy is distributed, e.g., MIT, Apache 2.0).
 
