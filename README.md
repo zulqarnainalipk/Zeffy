@@ -1,5 +1,8 @@
 # Zeffy: Advanced AutoML Pipeline
 
+
+![Zeffy AutoML Pipeline](zeffy.png "Zeffy - Automated Machine Learning Pipeline")
+
 ## 1. Project Overview
 
 Zeffy is a Python-based advanced automated machine learning (AutoML) pipeline designed to simplify and accelerate the development of high-performance machine learning models. 
