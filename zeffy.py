@@ -163,31 +163,23 @@ class ExplainabilityConfig(BaseModel):
     method: Literal["shap", "lime"] = Field("shap", description="Explainability method to use.")
     shap_explainer_params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the SHAP explainer.")
 
+
+from typing import ClassVar, Dict
+
 class ZeffyConfig(BaseModel):
     project_name: str = Field("Zeffy AutoML Project", description="Name of the project.")
     global_settings: GlobalSettings = Field(default_factory=GlobalSettings)
     data_loader: DataLoaderConfig
     preprocessing: List[PreprocessingStepConfig] = Field(default_factory=list)
     feature_engineering: Optional[FeatureEngineeringConfig] = Field(default_factory=FeatureEngineeringConfig)
-    models: List[ModelConfig] # Allow multiple models for comparison or ensembling
-    tuning: Optional[TuningConfig] = None # Make tuning optional
-    ensembling: Optional[EnsemblingConfig] = None # Make ensembling optional
+    models: List[ModelConfig]
+    tuning: Optional[TuningConfig] = None
+    ensembling: Optional[EnsemblingConfig] = None
     evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     explainability: Optional[ExplainabilityConfig] = Field(default_factory=ExplainabilityConfig)
 
-    @validator("models")
-    def check_models_not_empty(cls, v):
-        if not v:
-            raise ValueError("Models list cannot be empty.")
-        return v
-
-    class Config:
-        validate_assignment = True
-        extra = "forbid" # Forbid extra fields not defined in the model
-
-# Example of how to use it (for testing, will be in loader.py)
-# if __name__ == "__main__": # Zeffy: Main block from module, commented out.
-    sample_config_dict = {
+    # Annotate sample_config_dict as a ClassVar
+    sample_config_dict: ClassVar[Dict[str, Any]] = {
         "project_name": "Credit Scoring AutoML",
         "global_settings": {
             "random_seed": 123,
@@ -231,7 +223,7 @@ class ZeffyConfig(BaseModel):
             "method": "shap"
         }
     }
-
+    
     try:
         zeffy_config = ZeffyConfig(**sample_config_dict)
         print("Config parsed successfully!")
