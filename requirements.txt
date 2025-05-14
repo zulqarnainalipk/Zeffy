@@ -1,16 +1,25 @@
-pandas>=1.0.0
-numpy>=1.18.0
-scikit-learn>=1.0.0
-pyyaml>=5.3
-pydantic>=2.0.0
-lightgbm>=3.0.0
-xgboost>=1.0.0
-catboost>=1.0.0
-torch>=2.0.0 # For PyTorchTabularNN and other NN features
-torchvision>=0.15.0 # Often a companion to torch
-torchaudio>=2.0.0 # Often a companion to torch
-jupyter>=1.0.0 # For running the demonstration notebook
-notebook>=6.0.0 # For running the demonstration notebook
-ipykernel>=6.0.0 # For the Jupyter kernel
-joblib>=1.0.0 # For saving/loading ZeffyPipeline
 
+polars
+pandas
+numpy
+swifter
+tqdm
+scikit-learn
+lightgbm
+catboost
+xgboost
+dill
+optuna
+colorama
+regex
+unidecode
+gensim
+scipy
+ftfy
+nltk
+emoji
+pytorch_tabnet
+matplotlib
+seaborn
+cir-model
+pyspellchecker
