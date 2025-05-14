@@ -1,5 +1,5 @@
 
-# Zeffy: Advanced AutoML Pipeline - Single File Version
+# Zeffy: Advanced AutoML Pipeline 
 # -----------------------------------------------------
 # This file is a consolidated version of the Zeffy AutoML pipeline.
 # For detailed documentation, please refer to the accompanying README.md file.
@@ -1051,7 +1051,7 @@ class XGBoostClassifier(BaseModel):
         """Trains the XGBoost classifier."""
         if self.params.get("objective") == "multi:softprob" and "num_class" not in self.params:
             self.params["num_class"] = y.nunique()
-            print(f"Inferred num_class: {self.params["num_class"]} for multiclass XGBoost.")
+            print('Inferred num_class: {} for multiclass XGBoost.'.format(self.params["num_class"]))
 
         # Ensure use_label_encoder is set appropriately based on XGBoost version if not explicitly passed
         # For XGBoost >= 1.6.0, label encoding is handled internally or not needed for numeric labels.
@@ -1371,7 +1371,7 @@ class CatBoostClassifier(BaseModel):
 
         if fit_params.get("objective") == "MultiClass" and "classes_count" not in fit_params:
             fit_params["classes_count"] = y.nunique()
-            print(f"Inferred classes_count: {fit_params["classes_count"]} for multiclass CatBoost.")
+            print(f"Inferred classes_count: {fit_params['classes_count']} for multiclass CatBoost.")
 
         self.model = CBCModel(**fit_params)
         
@@ -1751,7 +1751,7 @@ class PyTorchTabularNN(BaseModel):
             ).to(self.device)
         elif self.params["input_features"] and self.params["output_features"]:
             # Fallback to a very simple default MLP if no architecture was provided but we have I/O dims
-            print(f"Using default SimpleMLP with input_dim={self.params["input_features"]}, output_dim={self.params["output_features"]}")
+            print('Using default SimpleMLP with input_dim={}, output_dim={}'.format(self.params["input_features"], self.params["output_features"]))
             self.model = SimpleMLP(input_dim=self.params["input_features"], output_dim=self.params["output_features"]).to(self.device)
         else:
             raise ValueError("Cannot initialize model: input_features and output_features must be set, or a valid model_definition_class provided.")
@@ -1807,7 +1807,7 @@ class PyTorchTabularNN(BaseModel):
             val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
             val_loader = DataLoader(val_dataset, batch_size=self.params["batch_size"], shuffle=False)
 
-        print(f"Starting PyTorch model training for {self.params["epochs"]} epochs...")
+        print('Starting PyTorch model training for {} epochs...'.format(self.params["epochs"]))
         self.model.train()
         for epoch in range(self.params["epochs"]):
             epoch_loss = 0.0
@@ -1820,7 +1820,7 @@ class PyTorchTabularNN(BaseModel):
                 epoch_loss += loss.item() * batch_X.size(0)
             
             avg_epoch_loss = epoch_loss / len(train_loader.dataset)
-            log_msg = f"Epoch [{epoch+1}/{self.params["epochs"]}], Train Loss: {avg_epoch_loss:.4f}"
+            log_msg = 'Epoch [{}/{}], Train Loss: {:.4f}'.format(epoch+1, self.params["epochs"], avg_epoch_loss)
 
             if val_loader:
                 self.model.eval()
@@ -1950,7 +1950,7 @@ class CustomNet(nn.Module):
         x = self.relu(self.fc1(x))
         return self.fc2(x)
 """
-    dummy_model_path = "/home/ubuntu/dummy_pytorch_model.py"
+    dummy_model_path = "/home/dummy_pytorch_model.py"
     with open(dummy_model_path, "w") as f:
         f.write(dummy_model_file_content)
     print(f"Created dummy PyTorch model definition at {dummy_model_path}")
@@ -2226,8 +2226,7 @@ if __name__ == "__main__":
         pipeline_from_file = ZeffyPipeline(config_path=dummy_config_path)
         pipeline_from_file.fit(X_train=X_train_main, y_train=y_train_main)
 
-        print("
---- Making predictions ---")
+        print("--- Making predictions ---")
         predictions = pipeline_from_file.predict(X_test_main)
         print(f"Predictions (first 10): {predictions[:10]}")
 
@@ -2236,19 +2235,16 @@ if __name__ == "__main__":
             if probabilities is not None:
                 print(f"Probabilities (first 5):\n{probabilities[:5]}")
 
-        print("
---- Evaluating pipeline ---")
+        print("--- Evaluating pipeline ---")
         eval_results = pipeline_from_file.evaluate(X_test_main, y_test_main)
         print(f"Evaluation results: {eval_results}")
 
-        print("
---- Saving pipeline ---")
+        print("--- Saving pipeline ---")
         save_path = "/home/ubuntu/zeffy_saved_pipeline"
         pipeline_from_file.save_pipeline(save_path)
         print(f"Pipeline saved to {save_path}")
 
-        print("
---- Loading pipeline ---")
+        print("--- Loading pipeline ---")
         loaded_pipeline = ZeffyPipeline.load_pipeline(save_path)
         print(f"Pipeline loaded. Project: {loaded_pipeline.config.project_name}")
         loaded_predictions = loaded_pipeline.predict(X_test_main)
@@ -2268,6 +2264,4 @@ if __name__ == "__main__":
             import shutil
             shutil.rmtree(save_path) # remove directory and its contents
 
-    print("
-Zeffy consolidated example finished.")
-
+    print("Zeffy consolidated example finished.")
