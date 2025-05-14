@@ -1,2259 +1,2548 @@
 
-# Zeffy: Advanced AutoML Pipeline 
-# -----------------------------------------------------
-# This file is a consolidated version of the Zeffy AutoML pipeline.
-# For detailed documentation, please refer to the accompanying README.md file.
-# -----------------------------------------------------
-import os
-import sys
-import yaml
-import json
-import logging
-import random
-import importlib.util
-from abc import ABC, abstractmethod
-from pathlib import Path
-from typing import List, Dict, Any, Optional, Union, Type, Literal, Callable
-import numpy as np
-import pandas as pd
-from pydantic import BaseModel as PydanticBaseModel, Field, validator, root_validator, Extra
-from sklearn.model_selection import StratifiedKFold, KFold, GroupKFold, TimeSeriesSplit
-from sklearn.metrics import (
-    accuracy_score, f1_score, precision_score, recall_score, roc_auc_score,
-    mean_squared_error, mean_absolute_error, r2_score
-)
-from sklearn.preprocessing import StandardScaler, MinMaxScaler, OneHotEncoder, LabelEncoder
-from sklearn.linear_model import LogisticRegression as SklearnLogisticRegression
-import lightgbm as lgb
-import xgboost as xgb
-import catboost as cb
-try:
-    import torch
-    import torch.nn as nn
-    import torch.optim as optim
-    from torch.utils.data import DataLoader, TensorDataset
-    PYTORCH_AVAILABLE = True
-except ImportError:
-    PYTORCH_AVAILABLE = False
-    class nn:
-        Module = object; Linear = object; ReLU = object; Sequential = object; BCEWithLogitsLoss = object; CrossEntropyLoss = object; MSELoss = object; BatchNorm1d=object; Dropout=object
-    class optim:
-        Adam = object; SGD = object
-    class TensorDataset: pass
-    class DataLoader: pass
-    class torch:
-        device = lambda x: x; tensor = lambda x, **k: x; float32=None; long=None; manual_seed=lambda x:x; sigmoid=lambda x:x; softmax=lambda x,**k:x; argmax=lambda x,**k:x; no_grad=lambda : type('no_grad', (), {'__enter__': lambda: None, '__exit__': lambda w,x,y,z: None})
-        cuda = type('cuda', (), {'is_available': lambda: False, 'manual_seed_all': lambda x:x})()
+import polars as pl#similar to pandas, but with better performance when dealing with large datasets.
+import pandas as pd#read csv,parquet
+import numpy as np#for scientific computation of matrices
+from tqdm import tqdm#progress bar
+from scipy.stats import kurtosis#calculate kurt
+#powerful plot libraries
+import matplotlib.pyplot as plt
+import seaborn as sns
 
-import joblib
-# --- Zeffy Code Starts Here ---
+#current supported kfold
+from sklearn.model_selection import KFold,StratifiedKFold,StratifiedGroupKFold,GroupKFold
+#metrics
+from sklearn.metrics import roc_auc_score,f1_score,matthews_corrcoef,precision_recall_curve, auc
+#models(lgb,xgb,cat,ridge,lr,tabnet)
+from sklearn.linear_model import Ridge,LinearRegression,LogisticRegression,Lasso
+#fit(oof_preds,target)
+from cir_model import CenteredIsotonicRegression
+from lightgbm import LGBMRegressor,LGBMClassifier,log_evaluation,early_stopping
+from catboost import CatBoostRegressor,CatBoostClassifier
+from xgboost import XGBRegressor,XGBClassifier
+from pytorch_tabnet.tab_model import TabNetRegressor,TabNetClassifier
+import optuna#automatic hyperparameter optimization framework
 
+import ast#parse Python list strings  transform '[a,b,c]' to [a,b,c]
+import copy#copy object
+import gc#rubbish collection
+import dill#serialize and deserialize objects (such as saving and loading tree models)
+from colorama import Fore, Style #print colorful text
+import os#interact with operation system
 
-# --- Consolidated Zeffy Modules --- 
+#deal with text
+import re#python's built-in regular expressions.
+from spellchecker import SpellChecker# spelling checker library
+from unidecode import unidecode#transform unicode to ASCII.
+#gene(topic) similarity   
+from gensim.models import Word2Vec
+from sklearn.feature_extraction.text import CountVectorizer,TfidfVectorizer#word2vec feature
+import ftfy#fixes text for you,correct unicode issues.
+import nltk #Natural Language toolkit
+from nltk.corpus import stopwords#import english stopwords
+import emoji#deal with emoji in natrual language
+from sklearn.preprocessing import RobustScaler#(x-median)/IQR
+from sklearn.decomposition import PCA,TruncatedSVD#Truncated Singular Value Decomposition
 
-# --- Zeffy Exceptions --- 
-# zeffy/utils/exceptions.py
+import warnings#avoid some negligible errors
+#The filterwarnings () method is used to set warning filters, which can control the output method and level of warning information.
+warnings.filterwarnings('ignore')
 
-class ZeffyError(Exception):
-    """Base class for exceptions in Zeffy."""
-    pass
+import random#provide some function to generate random_seed.
+#set random seed,to make sure model can be recurrented.
+def seed_everything(seed):
+    np.random.seed(seed)#numpy's random seed
+    random.seed(seed)#python built-in random seed
+seed_everything(seed=2025)
 
-class ZeffyConfigurationError(ZeffyError):
-    """Raised for errors in pipeline configuration."""
-    pass
-
-class ZeffyDataError(ZeffyError):
-    """Raised for errors related to data loading, validation, or processing."""
-    pass
-
-class ZeffyModelError(ZeffyError):
-    """Raised for errors related to model initialization, training, or prediction."""
-    pass
-
-class ZeffyPreprocessingError(ZeffyError):
-    """Raised for errors during data preprocessing."""
-    pass
-
-class ZeffyFeatureEngineeringError(ZeffyError):
-    """Raised for errors during feature engineering."""
-    pass
-
-class ZeffyTuningError(ZeffyError):
-    """Raised for errors during hyperparameter tuning."""
-    pass
-
-class ZeffyEnsemblingError(ZeffyError):
-    """Raised for errors during model ensembling."""
-    pass
-
-class ZeffyEvaluationError(ZeffyError):
-    """Raised for errors during model evaluation."""
-    pass
-
-class ZeffyExplainabilityError(ZeffyError):
-    """Raised for errors during model explainability tasks."""
-    pass
-
-class ZeffyNotFittedError(ZeffyModelError):
-    """Raised when attempting to use a model component that has not been fitted yet."""
-    def __init__(self, message="This Zeffy component has not been fitted yet. Please call fit() before using this method."):
-        super().__init__(message)
-
-
-# --- Zeffy Config Models --- 
-from typing import List, Dict, Any, Optional, Union, Literal
-from pydantic import BaseModel, Field, validator
-
-class GlobalSettings(BaseModel):
-    random_seed: int = Field(42, description="Global random seed for reproducibility.")
-    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"] = Field("INFO", description="Logging level.")
-    results_path: str = Field("results/zeffy_run", description="Path to save results, models, and logs.")
-    cache_intermediate_results: bool = Field(True, description="Whether to cache intermediate results to speed up reruns.")
-
-class DataLoaderConfig(BaseModel):
-    type: str = Field("csv", description="Type of data source (e.g., csv, parquet, database).")
-    path: Optional[str] = Field(None, description="Path to the data file (if applicable).")
-    target_column: str = Field("target", description="Name of the target variable column.")
-    # Add other data loading params like separator, sheet_name for excel, db_connection_string etc.
-    extra_params: Dict[str, Any] = Field(default_factory=dict, description="Extra parameters for the data loader.")
-
-class PreprocessingStepConfig(BaseModel):
-    name: str = Field(..., description="Name of the preprocessing step (e.g., missing_imputer, one_hot_encoder).")
-    columns: Optional[Union[List[str], Literal["all", "numeric", "categorical"]]] = Field(None, description="Columns to apply this step to.")
-    params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the preprocessing step.")
-
-class FeatureEngineeringConfig(BaseModel):
-    automated_feature_synthesis: bool = Field(False, description="Enable automated feature synthesis (e.g., DeepFeatureSynthesis).")
-    polynomial_features: Optional[Dict[str, Any]] = Field(None, description="Configuration for polynomial features.")
-    interaction_features: Optional[Dict[str, Any]] = Field(None, description="Configuration for interaction features.")
-    feature_selection: Optional[Dict[str, Any]] = Field(None, description="Configuration for feature selection (e.g., RFE, SHAP-based).")
-    custom_generators: List[Dict[str, Any]] = Field(default_factory=list, description="List of custom feature generator configurations.")
-
-class ModelConfig(BaseModel):
-    type: str = Field(..., description="Type of the model (e.g., lightgbm, xgboost, catboost, sklearn_logistic, pytorch_nn).")
-    task_type: Optional[Literal["classification", "regression"]] = Field(None, description="Explicitly set task type, otherwise inferred.")
-    params: Dict[str, Any] = Field(default_factory=dict, description="Hyperparameters for the model.")
-    # For NN/Pretrained models
-    architecture_definition: Optional[Union[str, Dict[str, Any]]] = Field(None, description="Path to model architecture file or dict defining it.")
-    pretrained_model_path: Optional[str] = Field(None, description="Path to a pretrained model checkpoint.")
-    fine_tune: bool = Field(False, description="Whether to fine-tune the pretrained model.")
-
-class TuningConfig(BaseModel):
-    enabled: bool = Field(True, description="Enable hyperparameter tuning.")
-    optimizer: Literal["optuna", "hyperopt", "grid_search", "random_search"] = Field("optuna", description="HPO library/optimizer to use.")
-    n_trials: int = Field(50, description="Number of trials for HPO.")
-    timeout_per_trial: Optional[int] = Field(None, description="Timeout in seconds for each HPO trial.")
-    metric_to_optimize: str = Field(..., description="Metric to optimize during HPO (e.g., roc_auc, neg_mean_squared_error).")
-    direction: Literal["maximize", "minimize"] = Field("maximize", description="Direction of optimization for the metric.")
-    search_space: Optional[Dict[str, Any]] = Field(None, description="Custom search space definition, otherwise use model defaults.")
-
-class EnsemblingConfig(BaseModel):
-    enabled: bool = Field(True, description="Enable model ensembling.")
-    method: Literal["averaging", "weighted_averaging", "median", "stacking", "blending"] = Field("stacking", description="Ensembling method.")
-    stacking_meta_learner: Optional[ModelConfig] = Field(None, description="Configuration for the meta-learner in stacking.")
-    # Add other ensembling params like weights for weighted_averaging, blend_ratio etc.
-    final_model_selection_strategy: Literal["best_single_model", "ensemble"] = Field("ensemble", description="Strategy for final model selection.")
-
-class EvaluationConfig(BaseModel):
-    metrics: List[str] = Field(default_factory=lambda: ["roc_auc", "accuracy", "f1"], description="List of metrics for evaluation.")
-    cross_validation_strategy: Dict[str, Any] = Field(default_factory=lambda: {"type": "StratifiedKFold", "n_splits": 5}, description="Cross-validation strategy.")
-
-class ExplainabilityConfig(BaseModel):
-    enabled: bool = Field(True, description="Enable model explainability features.")
-    method: Literal["shap", "lime"] = Field("shap", description="Explainability method to use.")
-    shap_explainer_params: Dict[str, Any] = Field(default_factory=dict, description="Parameters for the SHAP explainer.")
-
-
-from typing import ClassVar, Dict
-
-class ZeffyConfig(BaseModel):
-    project_name: str = Field("Zeffy AutoML Project", description="Name of the project.")
-    global_settings: GlobalSettings = Field(default_factory=GlobalSettings)
-    data_loader: DataLoaderConfig
-    preprocessing: List[PreprocessingStepConfig] = Field(default_factory=list)
-    feature_engineering: Optional[FeatureEngineeringConfig] = Field(default_factory=FeatureEngineeringConfig)
-    models: List[ModelConfig]
-    tuning: Optional[TuningConfig] = None
-    ensembling: Optional[EnsemblingConfig] = None
-    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
-    explainability: Optional[ExplainabilityConfig] = Field(default_factory=ExplainabilityConfig)
-
-    # Annotate sample_config_dict as a ClassVar
-    sample_config_dict: ClassVar[Dict[str, Any]] = {
-        "project_name": "Credit Scoring AutoML",
-        "global_settings": {
-            "random_seed": 123,
-            "log_level": "DEBUG",
-            "results_path": "outputs/credit_scoring"
-        },
-        "data_loader": {
-            "type": "csv",
-            "path": "data/train.csv",
-            "target_column": "default_status"
-        },
-        "preprocessing": [
-            {"name": "missing_imputer", "columns": "numeric", "params": {"strategy": "median"}},
-            {"name": "one_hot_encoder", "columns": "categorical", "params": {"handle_unknown": "ignore"}}
-        ],
-        "feature_engineering": {
-            "polynomial_features": {"degree": 2, "interaction_only": True, "columns": ["age", "income"]}
-        },
-        "models": [
-            {"type": "lightgbm", "task_type": "classification", "params": {"n_estimators": 200, "learning_rate": 0.05}},
-            {"type": "xgboost", "task_type": "classification", "params": {"n_estimators": 150}}
-        ],
-        "tuning": {
-            "enabled": True,
-            "optimizer": "optuna",
-            "n_trials": 100,
-            "metric_to_optimize": "roc_auc",
-            "direction": "maximize"
-        },
-        "ensembling": {
-            "enabled": True,
-            "method": "stacking",
-            "stacking_meta_learner": {"type": "sklearn_logistic", "task_type": "classification"}
-        },
-        "evaluation": {
-            "metrics": ["roc_auc", "accuracy", "precision", "recall", "f1"],
-            "cross_validation_strategy": {"type": "StratifiedKFold", "n_splits": 10, "shuffle": True}
-        },
-        "explainability": {
-            "enabled": True,
-            "method": "shap"
-        }
-    }
-    
-    try:
-        zeffy_config = ZeffyConfig(**sample_config_dict)
-        print("Config parsed successfully!")
-        print(f"Project Name: {zeffy_config.project_name}")
-        print(f"Random Seed: {zeffy_config.global_settings.random_seed}")
-        print(f"First model type: {zeffy_config.models[0].type}")
-        if zeffy_config.tuning:
-            print(f"Tuning enabled: {zeffy_config.tuning.enabled}")
-    except Exception as e: # PydanticValidationError
-        print(f"Config validation error: {e}")
-
-
-# --- Zeffy Config Loader --- 
-import yaml
-import json
-from pathlib import Path
-from typing import Dict, Any
-# from .models import ZeffyConfig # Zeffy: Relative import handled by consolidation order
-from ..utils.exceptions import ZeffyConfigurationError, ZeffyDataError
-
-def load_config_from_file(config_path: str) -> Dict[Any, Any]:
-    """Loads configuration from a YAML or JSON file."""
-    path = Path(config_path)
-    if not path.exists():
-        raise ZeffyConfigurationError(f"Configuration file not found: {config_path}")
-
-    try:
-        if path.suffix == ".yaml" or path.suffix == ".yml":
-            with open(path, "r") as f:
-                config_data = yaml.safe_load(f)
-        elif path.suffix == ".json":
-            with open(path, "r") as f:
-                config_data = json.load(f)
+class Zeffy():
+    def __init__(self,num_folds:int=5,
+                      n_repeats:int=1,
+                      models:list[tuple]=[],
+                      FE=None,
+                      CV_sample=None,
+                      group_col=None,
+                      target_col:str='target',
+                      weight_col:str='weight',
+                      drop_cols:list[str]=[],
+                      seed:int=2025,
+                      objective:str='regression',
+                      metric:str='mse',
+                      nan_margin:float=0.95,
+                      num_classes=None,
+                      infer_size:int=10000,
+                      save_oof_preds:bool=True,
+                      save_test_preds:bool=True,
+                      device:str='cpu',
+                      one_hot_max:int=50,
+                      custom_metric=None,
+                      use_optuna_find_params:int=0,
+                      optuna_direction=None,
+                      early_stop:int=100,
+                      use_pseudo_label:bool=False,
+                      use_high_corr_feat:bool=True,
+                      cross_cols:list[str]=[],
+                      labelencoder_cols:list[str]=[],
+                      list_stat:list[tuple]=[],
+                      word2vec_models:list[tuple]=[],
+                      text_cols:list[str]=[],
+                      plot_feature_importance:bool=False,
+                      log:int=100,
+                      exp_mode:bool=False,
+                      use_reduce_memory:bool=False,
+                      use_data_augmentation:bool=False,
+                      use_oof_as_feature:bool=False,
+                      use_CIR:bool=False,
+                      use_median_as_pred:bool=False,
+                      use_scaler:bool=False,
+                      use_TTA:bool=False,
+                      use_eval_metric:bool=True,
+                      feats_stat:list[tuple]=[],
+                      target_stat:list[tuple]=[],
+                      use_spellchecker:bool=False,
+                      AGGREGATIONS:list=['nunique','count','min','max','first',
+                                           'last', 'mean','median','sum','std','skew',kurtosis],
+                )->None:
+        """
+        num_folds             :the number of folds for k-fold cross validation.
+        n_repeats             :Here,we will modify the random seed of kfold and models to repeat 
+                               the cross validation several times.
+        models                :Built in 3 GBDTs as baseline, you can also use custom models,
+                               such as models=[(LGBMRegressor(**lgb_params),'lgb')]
+        FE                    :In addition to the built-in feature engineer, you can also customize feature engineer.
+        CV_sample             :This function is for X_train and y_train,sample_weight in cross validation. 
+                               In order to make the evaluation metrics of oof as accurate as possible,
+                               this function is not executed for X_valid and y_valid. 
+                               You can perform downsampling, upsampling, taking the first 10000 data 
+                               points, and other operations you want here, and 
+                               ultimately return any X_train or y_train,sample_weight.
+        group_col             :if you want to use groupkfold,then define this group_col.
+        target_col            :the column that you want to predict.
+        weight_col            :When training the model, give each sample a different weight. 
+                               If you don't set it, the weight of each sample will default to 1.
+        drop_cols             :The column to be deleted after all feature engineering is completed.
+        seed                  :random seed.
+        objective             :what task do you want to do?regression,binary or multi_class?
+        metric                :metric to evaluate your model.
+        nan_margin            :when the proportion of missing values in a column is greater than, we delete this column.
+        num_classes           :if objectibe is multi_class,you should define this class.
+        infer_size            :the test data might be large,we can predict in batches.
+        save_oof_preds        :you can save OOF for offline study.
+        save_test_preds       :you can save test_preds.For multi classification tasks, 
+                               the predicted result is the category.If you need to save the probability of the test_data,
+                               you can save test_preds.
+        device                :GBDT can training on GPU,you can set this parameter like NN.
+        one_hot_max           :If the nunique of a column is less than a certain value, perform one hot encoder.
+        custom_metric         :your custom_metric,when objective is multi_class,y_pred in custom(y_true,y_pred) is probability.            
+        use_optuna_find_params:count of use optuna find best params,0 is not use optuna to find params.
+                               Currently only LGBM is supported.
+        optuna_direction      :'minimize' or 'maximize',when you use custom metric,you need to define 
+                               the direction of optimization.
+        early_stop            :Common parameters of GBDT.
+        use_pseudo_label      :Whether to use pseudo labels.When it is true,adding the test data 
+                               to the training data and training again after obtaining the predicted 
+                               results of the test data.
+        use_high_corr_feat    :whether to use high correlation features or not. 
+        cross_cols            :Construct features for adding, subtracting, multiplying, and dividing these columns.
+        labelencoder_cols     :Convert categorical string variables into [1,2,â€¦â€¦,n].
+        list_stat             :example:[(list_col:str='step_list',list_gap:list[int]=[1,2,4])].
+                               list_col:If the data in a column is a list or str(list),
+                               such as [] or '[]', this can be used to extract diff and 
+                               shift features for list_cols.
+        word2vec_models       :Use models such as tfidf to extract features of string columns.
+                               example:word2vec_models=[(TfidfVectorizer(max_features=250,
+                                        ngram_range=(2,3)),col,model_name,use_svd)],
+                               use_svd:use Truncated Singular value decomposition to word2vec features.
+        text_cols             :extract features of words, sentences, and paragraphs from text here.
+        plot_feature_importance:after model training,whether print feature importance or not
+        log                   :log trees are trained in the GBDT model to output a validation set score once.
+        exp_mode              :In regression tasks, the distribution of target_col is a long tail distribution, 
+                               and this parameter can be used to perform log transform on the target_col.
+        use_reduce_memory     :if use function reduce_mem_usage(),then set this parameter True.
+        use_data_augmentation :if use data augmentation,During cross validation, the training data 
+                               will undergo PCA transformation followed by inverse transformation.
+        use_oof_as_feature    :Train the next model using the oof_preds obtained from the previous 
+                               model as features, and the same applies to inference.
+        use_CIR               :use CenteredIsotonicRegression to fit oof_preds and target.
+        use_median_as_pred    :use median.(axis=0)) instead of mean.(axis=0)
+        use_scaler            :use robust scaler to deal with outlier.
+        use_eval_metric       : use 'eval_metric' when training lightgbm or xgboost.
+        use_TTA               :use 'test time augmentation'.It is to use 
+                               data augmentation operations in the inference process
+        feats_stat            : (group_col,feature_col,aggregation_list)
+                               example:feats_stat = [ ('id','up_time', ['min', 'max'])   ]
+        target_stat           :We can use target's AGGREGATIONS to encode categorical variables.
+                               In order to obtain a reliable CV, this operation is performed separately 
+                               for the training set and validation set in cross validation. 
+                               example:target_stat = [ (group_col,target_col, aggregation_list)   ]
+                               To make it more versatile, you can also use  other variables 
+                               besides target to encode categorical variables.
+        use_spellchecker      :use SpellChecker to correct word in text.
+        AGGREGATIONS          :['nunique','count','min','max','first','last',
+                               'mean','median','sum','std','skew',kurtosis,q1,q3],
+        """
+        
+        #currented supported metric
+        self.reg_metric=['mae','rmse','mse','medae','rmsle','msle','mape','r2','smape',#regression
+                        ]
+        self.cla_metric=['auc','pr_auc','logloss','f1_score','mcc',#binary metric
+                        'accuracy','multi_logloss',#multi_class or classification
+                        ]
+        self.supported_metrics=['custom_metric']+self.reg_metric+self.cla_metric
+                               
+        #current supported models
+        self.supported_models=['lgb','cat','xgb','ridge','Lasso','LinearRegression','LogisticRegression','tabnet',
+                                'Word2Vec','tfidfvec','countvec',
+                              ]
+        #current supported kfold.
+        self.supported_kfolds=['KFold','GroupKFold','StratifiedKFold','StratifiedGroupKFold','purged_CV']
+        #current supported objective.
+        self.supported_objectives=['binary','multi_class','regression']
+        
+        print(f"Currently supported metrics:{self.supported_metrics}")
+        print(f"Currently supported models:{self.supported_models}")
+        print(f"Currently supported kfolds:{self.supported_kfolds}")
+        print(f"Currently supported objectives:{self.supported_objectives}")
+        
+        self.num_folds=num_folds
+        self.n_repeats=n_repeats
+        self.seed=seed
+        self.models=models
+        self.target_col=target_col
+        self.group_col=group_col
+        
+        self.FE=FE
+        self.CV_sample=CV_sample
+        self.drop_cols=drop_cols
+        
+        self.objective=objective.lower()
+        #binary multi_class,regression
+        if self.objective not in self.supported_objectives:
+            raise ValueError("Wrong or currently unsupported objective.")
+        
+        self.custom_metric=custom_metric#function
+        if self.custom_metric!=None:
+            self.metric=self.custom_metric.__name__.lower()
         else:
-            raise ZeffyConfigurationError(f"Unsupported configuration file format: {path.suffix}. Please use YAML or JSON.")
-        return config_data if config_data is not None else {}
-    except Exception as e:
-        raise ZeffyConfigurationError(f"Error reading configuration file {config_path}: {e}")
-
-def load_config(config_path: str = None, config_dict: Dict[Any, Any] = None) -> ZeffyConfig:
-    """Loads and validates the pipeline configuration from a file or dictionary.
-
-    Args:
-        config_path (str, optional): Path to a YAML or JSON configuration file.
-        config_dict (dict, optional): A dictionary containing the configuration.
-
-    Returns:
-        ZeffyConfig: A validated Pydantic model instance of the configuration.
-
-    Raises:
-        ZeffyConfigurationError: If neither config_path nor config_dict is provided, or if config is invalid.
-    """
-    raw_config: Dict[Any, Any]
-    if config_path:
-        raw_config = load_config_from_file(config_path)
-    elif config_dict:
-        raw_config = config_dict
-    else:
-        # This will likely fail validation in ZeffyConfig if required fields are missing.
-        print("Warning: No configuration path or dictionary provided. Attempting to initialize with an empty configuration.")
-        raw_config = {} 
-
-    try:
-        validated_config = ZeffyConfig(**raw_config)
-        return validated_config
-    except Exception as e: # PydanticValidationError is an Exception subclass
-        error_message = f"Zeffy configuration validation failed: {e}. Please check your configuration structure and values."
-        # For Pydantic V2, e.errors() gives more detailed error list
-        # detailed_errors = e.errors() if hasattr(e, 'errors') else str(e)
-        # print(f"Detailed Pydantic errors: {detailed_errors}") # For debugging
-        raise ZeffyConfigurationError(error_message)
-
-# if __name__ == "__main__": # Zeffy: Main block from module, commented out.
-    # Create dummy config files for testing loader.py directly
-    import os
-    dummy_configs_dir = "/home/ubuntu/zeffy_loader_test_configs"
-    if not os.path.exists(dummy_configs_dir):
-        os.makedirs(dummy_configs_dir)
-
-    dummy_yaml_path = os.path.join(dummy_configs_dir, "test_config.yaml")
-    dummy_json_path = os.path.join(dummy_configs_dir, "test_config.json")
-
-    sample_data_for_loader = {
-        "project_name": "Loader Test Project",
-        "data_loader": {
-            "type": "csv",
-            "path": "/data/input.csv",
-            "target_column": "outcome"
-        },
-        "models": [
-            {"type": "lightgbm", "task_type": "classification", "params": {"n_estimators": 50}}
-        ]
-    }
-
-    with open(dummy_yaml_path, 'w') as f:
-        yaml.dump(sample_data_for_loader, f)
-
-    with open(dummy_json_path, 'w') as f:
-        json.dump(sample_data_for_loader, f, indent=4)
-
-    print(f"Created dummy config files in {dummy_configs_dir}")
-
-    # Test loading YAML
-    try:
-        print("\n--- Testing YAML load ---")
-        config_yaml = load_config(config_path=dummy_yaml_path)
-        print("YAML Config loaded successfully:")
-        print(f"Project: {config_yaml.project_name}")
-    except ZeffyConfigurationError as e:
-        print(f"Error loading YAML: {e}")
-
-    # Test loading JSON
-    try:
-        print("\n--- Testing JSON load ---")
-        config_json = load_config(config_path=dummy_json_path)
-        print("JSON Config loaded successfully:")
-        print(f"Project: {config_json.project_name}")
-    except ZeffyConfigurationError as e:
-        print(f"Error loading JSON: {e}")
-
-    # Test loading with a dictionary
-    try:
-        print("\n--- Testing Dict load ---")
-        config_dict_loaded = load_config(config_dict=sample_data_for_loader)
-        print("Dict Config loaded successfully:")
-        print(f"Project: {config_dict_loaded.project_name}")
-    except ZeffyConfigurationError as e:
-        print(f"Error loading from dict: {e}")
-
-    # Test with missing required field (e.g., models)
-    invalid_data = {
-        "project_name": "Invalid Project",
-        "data_loader": {"type": "csv", "path": "/data/input.csv", "target_column": "outcome"}
-    }
-    try:
-        print("\n--- Testing Invalid Dict load (missing models) ---")
-        load_config(config_dict=invalid_data)
-    except ZeffyConfigurationError as e:
-        print(f"Correctly caught ZeffyConfigurationError for missing models: {e}")
-
-    # Test with no config (should raise ZeffyConfigurationError due to missing required fields)
-    try:
-        print("\n--- Testing No Config load ---")
-        load_config()
-    except ZeffyConfigurationError as e:
-        print(f"Correctly caught ZeffyConfigurationError for no config: {e}")
+            self.metric=metric.lower()
+        if self.metric not in self.supported_metrics and self.custom_metric==None:
+            raise ValueError("Wrong or currently unsupported metric,You can customize the evaluation metrics using 'custom_metric'.")
         
-    # Test non-existent file
-    try:
-        print("\n--- Testing Non-existent file load ---")
-        load_config(config_path="/home/ubuntu/non_existent_config.yaml")
-    except ZeffyConfigurationError as e:
-        print(f"Correctly caught ZeffyConfigurationError for non-existent file: {e}")
+        self.nan_margin=nan_margin
+        if self.nan_margin<0 or self.nan_margin>1:
+            raise ValueError("nan_margin must be within the range of 0 to 1.")
+        self.infer_size=infer_size
+        if self.infer_size<=0 or type(self.infer_size) is not int:
+            raise ValueError("infer size must be greater than 0 and must be int.")  
+        
+        self.save_oof_preds=save_oof_preds
+        self.save_test_preds=save_test_preds
 
-    # Test unsupported file type
-    unsupported_file_path = os.path.join(dummy_configs_dir, "test_config.txt")
-    with open(unsupported_file_path, 'w') as f:
-        f.write("this is not a yaml or json")
-    try:
-        print("\n--- Testing Unsupported file type load ---")
-        load_config(config_path=unsupported_file_path)
-    except ZeffyConfigurationError as e:
-        print(f"Correctly caught ZeffyConfigurationError for unsupported file type: {e}")
-
-    print("\nConfig loader tests finished.")
-
-
-# --- Zeffy Base Model --- 
-from abc import ABC, abstractmethod
-from typing import Any, Dict, Optional
-import pandas as pd
-
-class BaseModel(ABC):
-    """Abstract base class for all models in Zeffy."""
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        self.model_type = model_type
-        self.task_type = task_type # "classification" or "regression"
-        self.params = params if params is not None else {}
-        self.model: Any = None # This will hold the actual trained model instance
-        self.is_trained: bool = False
-
-    @abstractmethod
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, **kwargs) -> None:
-        """Trains the model."""
-        pass
-
-    @abstractmethod
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        """Generates predictions."""
-        pass
-
-    @abstractmethod
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        """Generates probability predictions (for classification tasks)."""
-        pass
-
-    def get_params(self) -> Dict[str, Any]:
-        """Returns the model parameters."""
-        return self.params
-
-    def set_params(self, **params) -> None:
-        """Sets the model parameters."""
-        self.params.update(params)
-        # Re-initialize model if necessary, or handle during fit
-
-    def save_model(self, path: str) -> None:
-        """Saves the trained model to a file."""
-        # Generic save, specific models might override or use a helper
-        # For example, using joblib or dill
-        import joblib # Or dill, or model-specific save methods
-        try:
-            joblib.dump(self.model, path)
-            print(f"Model {self.model_type} saved to {path}")
-        except Exception as e:
-            print(f"Error saving model {self.model_type} to {path}: {e}")
-            raise
-
-    def load_model(self, path: str) -> None:
-        """Loads a trained model from a file."""
-        import joblib
-        try:
-            self.model = joblib.load(path)
-            self.is_trained = True
-            print(f"Model {self.model_type} loaded from {path}")
-        except Exception as e:
-            print(f"Error loading model {self.model_type} from {path}: {e}")
-            raise
-
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
-        """Returns feature importances if the model supports it."""
-        if hasattr(self.model, 'feature_importances_'):
-            return pd.DataFrame({
-                'feature': self.model.feature_names_in_ if hasattr(self.model, 'feature_names_in_') else range(len(self.model.feature_importances_)),
-                'importance': self.model.feature_importances_
-            }).sort_values(by='importance', ascending=False)
-        elif hasattr(self.model, 'coef_'): # For linear models
-             return pd.DataFrame({
-                'feature': self.model.feature_names_in_ if hasattr(self.model, 'feature_names_in_') else range(len(self.model.coef_)),
-                'importance': self.model.coef_.flatten() # Flatten in case of multi-class coefs
-            }).sort_values(by='importance', key=abs, ascending=False)
-        print(f"Feature importance not directly available for model type {self.model_type}")
-        return None
-
-    def __str__(self):
-        return f"{self.__class__.__name__}(model_type=\'{self.model_type}\', task_type=\'{self.task_type}\', params={self.params})"
-
-
-# --- Zeffy Model Registry --- 
-from typing import Dict, Type, Callable
-# from .base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-
-class ModelRegistry:
-    """A registry for model classes and their instantiation."""
-    _registry: Dict[str, Type[BaseModel]] = {}
-
-    @classmethod
-    def register(cls, model_type: str) -> Callable[[Type[BaseModel]], Type[BaseModel]]:
-        """Decorator to register a model class."""
-        def decorator(model_class: Type[BaseModel]) -> Type[BaseModel]:
-            if model_type in cls._registry:
-                print(f"Warning: Model type 	hemed_text_color_red_bold_start_bold_end_themed_text_color_end{model_type}	hemed_text_color_red_bold_start_bold_end_themed_text_color_end is already registered. Overwriting.")
-            cls._registry[model_type] = model_class
-            print(f"Model 	hemed_text_color_green_bold_start_bold_end_themed_text_color_end{model_type}	hemed_text_color_green_bold_start_bold_end_themed_text_color_end registered with class 	hemed_text_color_green_bold_start_bold_end_themed_text_color_end{model_class.__name__}	hemed_text_color_green_bold_start_bold_end_themed_text_color_end")
-            return model_class
-        return decorator
-
-    @classmethod
-    def get_model_class(cls, model_type: str) -> Type[BaseModel]:
-        """Retrieves a model class from the registry."""
-        if model_type not in cls._registry:
-            raise ValueError(f"Model type 	hemed_text_color_red_bold_start_bold_end_themed_text_color_end{model_type}	hemed_text_color_red_bold_start_bold_end_themed_text_color_end not found in registry. Available models: {list(cls._registry.keys())}")
-        return cls._registry[model_type]
-
-    @classmethod
-    def create_model(cls, model_type: str, task_type: str, params: Dict = None) -> BaseModel:
-        """Creates an instance of a registered model."""
-        model_class = cls.get_model_class(model_type)
-        try:
-            return model_class(model_type=model_type, task_type=task_type, params=params or {})
-        except Exception as e:
-            print(f"Error instantiating model 	hemed_text_color_red_bold_start_bold_end_themed_text_color_end{model_type}	hemed_text_color_red_bold_start_bold_end_themed_text_color_end of class 	hemed_text_color_red_bold_start_bold_end_themed_text_color_end{model_class.__name__}	hemed_text_color_red_bold_start_bold_end_themed_text_color_end: {e}")
-            raise
-
-# Convenience functions for direct use
-def register_model(model_type: str) -> Callable[[Type[BaseModel]], Type[BaseModel]]:
-    return ModelRegistry.register(model_type)
-
-def get_model(model_type: str, task_type: str, params: Dict = None) -> BaseModel:
-    return ModelRegistry.create_model(model_type, task_type, params)
-
-# if __name__ == "__main__": # Zeffy: Main block from module, commented out.
-    # Example Usage of ModelRegistry
-
-    @register_model("dummy_classifier")
-    class DummyClassifier(BaseModel):
-        def fit(self, X, y, X_val=None, y_val=None, **kwargs):
-            print(f"Fitting DummyClassifier with params: {self.params} on data shape {X.shape}")
-            self.model = "trained_dummy_classifier"
-            self.is_trained = True
-
-        def predict(self, X, **kwargs):
-            if not self.is_trained:
-                raise RuntimeError("Model not trained yet.")
-            print(f"Predicting with DummyClassifier on data shape {X.shape}")
-            return [0] * len(X) # Dummy predictions
-
-        def predict_proba(self, X, **kwargs):
-            if not self.is_trained:
-                raise RuntimeError("Model not trained yet.")
-            print(f"Predicting probabilities with DummyClassifier on data shape {X.shape}")
-            return [[1.0, 0.0]] * len(X) # Dummy probabilities
-
-    @register_model("dummy_regressor")
-    class DummyRegressor(BaseModel):
-        def fit(self, X, y, X_val=None, y_val=None, **kwargs):
-            print(f"Fitting DummyRegressor with params: {self.params} on data shape {X.shape}")
-            self.model = "trained_dummy_regressor"
-            self.is_trained = True
-
-        def predict(self, X, **kwargs):
-            if not self.is_trained:
-                raise RuntimeError("Model not trained yet.")
-            print(f"Predicting with DummyRegressor on data shape {X.shape}")
-            return [0.0] * len(X) # Dummy predictions
-
-        def predict_proba(self, X, **kwargs):
-            # Regression models typically don't have predict_proba
-            return None
-
-    # Test creating models
-    try:
-        print("\n--- Testing Model Creation ---")
-        classifier_params = {"C": 1.0, "solver": "liblinear"}
-        dummy_clf = get_model("dummy_classifier", task_type="classification", params=classifier_params)
-        print(f"Created model: {dummy_clf}")
-        # dummy_clf.fit(pd.DataFrame([[1,2],[3,4]]), pd.Series([0,1])) # Requires pandas
-        # dummy_clf.predict(pd.DataFrame([[5,6]])) # Requires pandas
-
-        regressor_params = {"alpha": 0.5}
-        dummy_reg = get_model("dummy_regressor", task_type="regression", params=regressor_params)
-        print(f"Created model: {dummy_reg}")
-
-        # Test getting a non-existent model
-        print("\n--- Testing Non-existent Model ---")
-        get_model("non_existent_model", task_type="classification")
-
-    except ValueError as e:
-        print(f"Correctly caught error: {e}")
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-
-    print("\nModel registry tests finished.")
-
-
-# --- Zeffy Model Implementations --- 
-import lightgbm as lgb
-import pandas as pd
-from typing import Any, Dict, Optional
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-@register_model("lightgbm_classifier")
-class LightGBMClassifier(BaseModel):
-    """LightGBM Classifier model."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params)
-        if self.task_type != "classification":
-            raise ValueError(f"LightGBMClassifier is for classification tasks, but task_type is {self.task_type}")
-        self._default_params = {
-            "objective": "binary", # or "multiclass"
-            "metric": "auc", # or "multi_logloss"
-            "boosting_type": "gbdt",
-            "n_estimators": 100,
-            "learning_rate": 0.1,
-            "num_leaves": 31,
-            "max_depth": -1,
-            "random_state": self.params.get("random_state", 42), # Use from global config if possible
-            "n_jobs": -1,
-            "verbose": -1,
+        self.num_classes=num_classes
+        self.device=device.lower()
+        if (self.objective=='binary') and self.num_classes!=2:
+            raise ValueError("num_classes must be 2.")
+        elif (self.objective=='multi_class') and (self.num_classes==None):
+            raise ValueError("num_classes must be a number(int).")
+        self.one_hot_max=one_hot_max
+        
+        self.use_optuna_find_params=use_optuna_find_params
+        self.optuna_direction=optuna_direction
+        self.direction2metric={
+            'maximize':['accuracy','auc','pr_auc','f1_score','mcc',#classification
+                        'r2'#regression
+                       ],
+            'minimize':['medae','mape','mae','rmse','mse','rmsle','msle','smape',#regression
+                        'logloss','multi_logloss'#classification
+                       ]
         }
-        self.params = {**self._default_params, **self.params} # Merge user params with defaults
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, **kwargs) -> None:
-        """Trains the LightGBM classifier."""
-        if self.params.get("objective") == "multiclass" and "num_class" not in self.params:
-            self.params["num_class"] = y.nunique()
-            print(f"Inferred num_class: {self.params['num_class']} for multiclass LightGBM.")
-
-        self.model = lgb.LGBMClassifier(**self.params)
         
-        eval_set = []
-        callbacks = []
-
-        if X_val is not None and y_val is not None:
-            eval_set = [(X_val, y_val)]
-            # Add early stopping callback if configured
-            early_stopping_rounds = kwargs.get("early_stopping_rounds", self.params.get("early_stopping_rounds", None))
-            if early_stopping_rounds:
-                callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=-1))
+        if (self.use_optuna_find_params) and (self.custom_metric!=None) and self.optuna_direction not in ['minimize','maximize']:
+            raise ValueError("optuna_direction must be 'minimize' or 'maximize'.")
+        self.early_stop=early_stop
+        self.test=None#test data will be replaced when call predict function.
+        self.use_pseudo_label=use_pseudo_label
+        self.use_high_corr_feat=use_high_corr_feat
+        self.cross_cols=cross_cols
+        self.labelencoder_cols=labelencoder_cols
+        self.list_stat=list_stat
+        self.list_cols=[l[0] for l in self.list_stat]
         
-        print(f"Fitting LightGBMClassifier with params: {self.model.get_params()}")
-        try:
-            self.model.fit(
-                X, y, 
-                eval_set=eval_set if eval_set else None,
-                callbacks=callbacks if callbacks else None
-            )
-            self.is_trained = True
-            print("LightGBMClassifier training completed.")
-        except Exception as e:
-            print(f"Error during LightGBMClassifier training: {e}")
-            # Potentially log the full traceback
-            raise
-
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        """Generates predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        try:
-            return self.model.predict(X, **kwargs)
-        except Exception as e:
-            print(f"Error during LightGBMClassifier prediction: {e}")
-            raise
-
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        """Generates probability predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        if not hasattr(self.model, "predict_proba"):
-            print(f"Model {self.model_type} does not support predict_proba.")
-            return None
-        try:
-            return self.model.predict_proba(X, **kwargs)
-        except Exception as e:
-            print(f"Error during LightGBMClassifier probability prediction: {e}")
-            raise
-
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
-        """Returns feature importances if the model supports it."""
-        if not self.is_trained or not hasattr(self.model, 'feature_importances_'):
-            print("Model not trained or feature importances not available.")
-            return None
-        
-        feature_names = X.columns if hasattr(X, 'columns') else [f'feature_{i}' for i in range(X.shape[1])]
-        if hasattr(self.model, 'feature_name_') and list(self.model.feature_name_) != ['Column_0', 'Column_1'] : # default names if not set
-             feature_names = self.model.feature_name_
-        elif hasattr(self.model, 'feature_names_in_'):
-            feature_names = self.model.feature_names_in_
-
-        importances = self.model.feature_importances_
-        
-        importance_df = pd.DataFrame({
-            'feature': feature_names,
-            'importance': importances
-        }).sort_values(by='importance', ascending=False).reset_index(drop=True)
-        return importance_df
-
-# Example of how to test this specific model (can be run with python -m zeffy.models.classification.lightgbm_classifier)
-if __name__ == '__main__':
-    from sklearn.datasets import make_classification
-    from sklearn.model_selection import train_test_split
-    import numpy as np
-
-    print("Testing LightGBMClassifier...")
-    X_np, y_np = make_classification(n_samples=200, n_features=20, n_informative=10, n_classes=2, random_state=42)
-    X_df = pd.DataFrame(X_np, columns=[f'feature_{i}' for i in range(X_np.shape[1])])
-    y_s = pd.Series(y_np)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_df, y_s, test_size=0.2, random_state=42)
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=42) # 0.25 * 0.8 = 0.2
-
-    # Binary classification test
-    print("\n--- Binary Classification Test ---")
-    lgbm_clf_binary_params = {
-        "n_estimators": 50,
-        "learning_rate": 0.05,
-        "random_state": 42,
-        "objective": "binary",
-        "metric": "binary_logloss,auc"
-    }
-    lgbm_binary_model = LightGBMClassifier(model_type="lightgbm_classifier", task_type="classification", params=lgbm_clf_binary_params)
-    print(f"Initial params: {lgbm_binary_model.params}")
-    lgbm_binary_model.fit(X_train, y_train, X_val=X_val, y_val=y_val, early_stopping_rounds=10)
-    
-    binary_preds = lgbm_binary_model.predict(X_test)
-    print(f"Binary predictions (first 5): {binary_preds[:5]}")
-    binary_probas = lgbm_binary_model.predict_proba(X_test)
-    print(f"Binary probabilities (first 5):\n{binary_probas[:5]}")
-    
-    feature_imp = lgbm_binary_model.get_feature_importance()
-    if feature_imp is not None:
-        print(f"Feature importances (top 5):\n{feature_imp.head()}")
-
-    # Multiclass classification test
-    print("\n--- Multiclass Classification Test ---")
-    X_multi_np, y_multi_np = make_classification(n_samples=300, n_features=20, n_informative=15, n_classes=3, random_state=42)
-    X_multi_df = pd.DataFrame(X_multi_np, columns=[f'feature_m_{i}' for i in range(X_multi_np.shape[1])])
-    y_multi_s = pd.Series(y_multi_np)
-    X_m_train, X_m_test, y_m_train, y_m_test = train_test_split(X_multi_df, y_multi_s, test_size=0.2, random_state=42)
-    X_m_train, X_m_val, y_m_train, y_m_val = train_test_split(X_m_train, y_m_train, test_size=0.25, random_state=42)
-
-    lgbm_clf_multi_params = {
-        "n_estimators": 60,
-        "learning_rate": 0.08,
-        "random_state": 123,
-        "objective": "multiclass", # num_class will be inferred
-        "metric": "multi_logloss"
-    }
-    lgbm_multi_model = LightGBMClassifier(model_type="lightgbm_classifier", task_type="classification", params=lgbm_clf_multi_params)
-    lgbm_multi_model.fit(X_m_train, y_m_train, X_val=X_m_val, y_m_val=y_m_val, early_stopping_rounds=5)
-
-    multi_preds = lgbm_multi_model.predict(X_m_test)
-    print(f"Multiclass predictions (first 5): {multi_preds[:5]}")
-    multi_probas = lgbm_multi_model.predict_proba(X_m_test)
-    print(f"Multiclass probabilities (first 5):\n{multi_probas[:5]}")
-
-    print("\nLightGBMClassifier tests finished.")
-
-
-import lightgbm as lgb
-import pandas as pd
-from typing import Any, Dict, Optional
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-@register_model("lightgbm_regressor")
-class LightGBMRegressor(BaseModel):
-    """LightGBM Regressor model."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params)
-        if self.task_type != "regression":
-            raise ValueError(f"LightGBMRegressor is for regression tasks, but task_type is {self.task_type}")
-        self._default_params = {
-            "objective": "regression", # Common objectives: regression_l1, regression_l2, huber, poisson, etc.
-            "metric": "rmse", # Common metrics: rmse, mae, rmsle
-            "boosting_type": "gbdt",
-            "n_estimators": 100,
-            "learning_rate": 0.1,
-            "num_leaves": 31,
-            "max_depth": -1,
-            "random_state": self.params.get("random_state", 42),
-            "n_jobs": -1,
-            "verbose": -1,
-        }
-        self.params = {**self._default_params, **self.params} # Merge user params with defaults
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, **kwargs) -> None:
-        """Trains the LightGBM regressor."""
-        self.model = lgb.LGBMRegressor(**self.params)
-        
-        eval_set = []
-        callbacks = []
-
-        if X_val is not None and y_val is not None:
-            eval_set = [(X_val, y_val)]
-            early_stopping_rounds = kwargs.get("early_stopping_rounds", self.params.get("early_stopping_rounds", None))
-            if early_stopping_rounds:
-                callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping_rounds, verbose=-1))
-        
-        print(f"Fitting LightGBMRegressor with params: {self.model.get_params()}")
-        try:
-            self.model.fit(
-                X, y, 
-                eval_set=eval_set if eval_set else None,
-                callbacks=callbacks if callbacks else None
-            )
-            self.is_trained = True
-            print("LightGBMRegressor training completed.")
-        except Exception as e:
-            print(f"Error during LightGBMRegressor training: {e}")
-            raise
-
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        """Generates predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        try:
-            return self.model.predict(X, **kwargs)
-        except Exception as e:
-            print(f"Error during LightGBMRegressor prediction: {e}")
-            raise
-
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        """Regressor does not support predict_proba."""
-        print(f"Model {self.model_type} (Regressor) does not support predict_proba.")
-        return None
-
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
-        """Returns feature importances if the model supports it."""
-        if not self.is_trained or not hasattr(self.model, 'feature_importances_'):
-            print("Model not trained or feature importances not available.")
-            return None
-        
-        feature_names = X.columns if hasattr(X, 'columns') else [f'feature_{i}' for i in range(X.shape[1])]
-        if hasattr(self.model, 'feature_name_') and list(self.model.feature_name_) != ['Column_0', 'Column_1']:
-             feature_names = self.model.feature_name_
-        elif hasattr(self.model, 'feature_names_in_'):
-            feature_names = self.model.feature_names_in_
-
-        importances = self.model.feature_importances_
-        
-        importance_df = pd.DataFrame({
-            'feature': feature_names,
-            'importance': importances
-        }).sort_values(by='importance', ascending=False).reset_index(drop=True)
-        return importance_df
-
-# Example of how to test this specific model
-if __name__ == '__main__':
-    from sklearn.datasets import make_regression
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import mean_squared_error
-    import numpy as np
-
-    print("Testing LightGBMRegressor...")
-    X_np, y_np = make_regression(n_samples=200, n_features=20, n_informative=10, random_state=42)
-    X_df = pd.DataFrame(X_np, columns=[f'feature_{i}' for i in range(X_np.shape[1])])
-    y_s = pd.Series(y_np)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_df, y_s, test_size=0.2, random_state=42)
-    X_train, X_val, y_train, y_val = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
-
-    lgbm_reg_params = {
-        "n_estimators": 75,
-        "learning_rate": 0.07,
-        "random_state": 123,
-        "objective": "regression_l2",
-        "metric": "rmse"
-    }
-    lgbm_reg_model = LightGBMRegressor(model_type="lightgbm_regressor", task_type="regression", params=lgbm_reg_params)
-    print(f"Initial params: {lgbm_reg_model.params}")
-    lgbm_reg_model.fit(X_train, y_train, X_val=X_val, y_val=y_val, early_stopping_rounds=10)
-    
-    reg_preds = lgbm_reg_model.predict(X_test)
-    print(f"Regression predictions (first 5): {reg_preds[:5]}")
-    
-    rmse = mean_squared_error(y_test, reg_preds, squared=False)
-    print(f"RMSE on test set: {rmse:.4f}")
-
-    feature_imp = lgbm_reg_model.get_feature_importance()
-    if feature_imp is not None:
-        print(f"Feature importances (top 5):\n{feature_imp.head()}")
-
-    # Test predict_proba (should indicate not supported)
-    lgbm_reg_model.predict_proba(X_test)
-
-    print("\nLightGBMRegressor tests finished.")
-
-
-import pandas as pd
-from sklearn.linear_model import LogisticRegression as SklearnLogisticRegression
-from typing import Any, Dict, Optional
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-@register_model("sklearn_logistic_regression")
-class SklearnLogisticRegressionModel(BaseModel):
-    """Scikit-learn Logistic Regression model for classification."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params)
-        if self.task_type != "classification":
-            raise ValueError(f"SklearnLogisticRegressionModel is for classification tasks, but task_type is {self.task_type}")
-        
-        self._default_params = {
-            "solver": "liblinear", # Good default for many cases
-            "random_state": self.params.get("random_state", 42),
-            "C": 1.0,
-            "penalty": "l2",
-            "max_iter": 100,
-            "n_jobs": -1
-        }
-        self.params = {**self._default_params, **self.params}
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, **kwargs) -> None:
-        """Trains the Scikit-learn Logistic Regression model."""
-        # Sklearn models generally don't use X_val, y_val directly in fit for early stopping like GBDTs
-        # However, they could be used for custom callbacks or logging if needed.
-        
-        # Ensure params are compatible with SklearnLogisticRegression
-        current_params = self.params.copy()
-        # n_jobs is not a direct param for LogisticRegression constructor but can be used by some solvers internally or for CV
-        # For simplicity, we remove it if not directly supported or handle it if a CV search is integrated here.
-        if "n_jobs" in current_params and current_params.get("solver") not in ["saga"] : # saga solver uses n_jobs
-            #del current_params["n_jobs"] # or handle appropriately
-            pass # keep it for now, sklearn might ignore if not applicable
-
-        self.model = SklearnLogisticRegression(**current_params)
-        
-        print(f"Fitting SklearnLogisticRegressionModel with params: {self.model.get_params()}")
-        try:
-            self.model.fit(X, y)
-            self.is_trained = True
-            print("SklearnLogisticRegressionModel training completed.")
-        except Exception as e:
-            print(f"Error during SklearnLogisticRegressionModel training: {e}")
-            raise
-
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        """Generates predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        try:
-            return self.model.predict(X, **kwargs)
-        except Exception as e:
-            print(f"Error during SklearnLogisticRegressionModel prediction: {e}")
-            raise
-
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        """Generates probability predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        if not hasattr(self.model, "predict_proba"):
-            print(f"Model {self.model_type} does not support predict_proba.") # Should not happen for LogisticRegression
-            return None
-        try:
-            return self.model.predict_proba(X, **kwargs)
-        except Exception as e:
-            print(f"Error during SklearnLogisticRegressionModel probability prediction: {e}")
-            raise
-
-# Example of how to test this specific model
-if __name__ == '__main__':
-    from sklearn.datasets import make_classification
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import accuracy_score, roc_auc_score
-
-    print("Testing SklearnLogisticRegressionModel...")
-    X_np, y_np = make_classification(n_samples=200, n_features=20, n_informative=10, n_classes=2, random_state=42)
-    X_df = pd.DataFrame(X_np, columns=[f'feature_{i}' for i in range(X_np.shape[1])])
-    y_s = pd.Series(y_np)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_df, y_s, test_size=0.25, random_state=42)
-
-    # Binary classification test
-    print("\n--- Binary Classification Test ---")
-    logreg_params = {
-        "C": 0.5,
-        "random_state": 123,
-        "solver": "liblinear",
-        "max_iter": 200
-    }
-    logreg_model = SklearnLogisticRegressionModel(model_type="sklearn_logistic_regression", task_type="classification", params=logreg_params)
-    print(f"Initial params: {logreg_model.params}")
-    logreg_model.fit(X_train, y_train)
-    
-    binary_preds = logreg_model.predict(X_test)
-    binary_probas = logreg_model.predict_proba(X_test)
-
-    acc = accuracy_score(y_test, binary_preds)
-    auc = roc_auc_score(y_test, binary_probas[:, 1])
-    print(f"Test Accuracy: {acc:.4f}")
-    print(f"Test AUC: {auc:.4f}")
-    print(f"Binary predictions (first 5): {binary_preds[:5]}")
-    print(f"Binary probabilities (first 5):\n{binary_probas[:5]}")
-    
-    feature_imp = logreg_model.get_feature_importance()
-    if feature_imp is not None:
-        print(f"Feature importances (coefficients) (top 5):\n{feature_imp.head()}")
-
-    # Test with multiclass (LogisticRegression handles it automatically)
-    print("\n--- Multiclass Classification Test (using LogisticRegression OVR) ---")
-    X_multi_np, y_multi_np = make_classification(n_samples=300, n_features=20, n_informative=15, n_classes=3, random_state=42)
-    X_multi_df = pd.DataFrame(X_multi_np, columns=[f'feature_m_{i}' for i in range(X_multi_np.shape[1])])
-    y_multi_s = pd.Series(y_multi_np)
-    X_m_train, X_m_test, y_m_train, y_m_test = train_test_split(X_multi_df, y_multi_s, test_size=0.25, random_state=42)
-
-    logreg_multi_params = {"random_state": 42, "solver": "lbfgs", "multi_class": "ovr"} # lbfgs supports multiclass
-    logreg_multi_model = SklearnLogisticRegressionModel(model_type="sklearn_logistic_regression", task_type="classification", params=logreg_multi_params)
-    logreg_multi_model.fit(X_m_train, y_m_train)
-
-    multi_preds = logreg_multi_model.predict(X_m_test)
-    multi_probas = logreg_multi_model.predict_proba(X_m_test)
-    multi_acc = accuracy_score(y_m_test, multi_preds)
-    # roc_auc_score needs one-hot encoded y_true for multiclass or use ovo/ovr options
-    print(f"Multiclass Test Accuracy: {multi_acc:.4f}")
-    print(f"Multiclass predictions (first 5): {multi_preds[:5]}")
-    print(f"Multiclass probabilities (first 5):\n{multi_probas[:5]}")
-
-    print("\nSklearnLogisticRegressionModel tests finished.")
-
-
-import xgboost as xgb
-import pandas as pd
-from typing import Any, Dict, Optional
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-@register_model("xgboost_classifier")
-class XGBoostClassifier(BaseModel):
-    """XGBoost Classifier model."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params)
-        if self.task_type != "classification":
-            raise ValueError(f"XGBoostClassifier is for classification tasks, but task_type is {self.task_type}")
-        
-        self._default_params = {
-            "objective": "binary:logistic", # or "multi:softprob"
-            "eval_metric": "logloss", # or "mlogloss"
-            "n_estimators": 100,
-            "learning_rate": 0.1,
-            "max_depth": 3,
-            "random_state": self.params.get("random_state", 42),
-            "n_jobs": -1,
-            "use_label_encoder": False, # Suppress warning for newer XGBoost versions
-        }
-        self.params = {**self._default_params, **self.params} # Merge user params with defaults
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, **kwargs) -> None:
-        """Trains the XGBoost classifier."""
-        if self.params.get("objective") == "multi:softprob" and "num_class" not in self.params:
-            self.params["num_class"] = y.nunique()
-            print('Inferred num_class: {} for multiclass XGBoost.'.format(self.params["num_class"]))
-
-        # Ensure use_label_encoder is set appropriately based on XGBoost version if not explicitly passed
-        # For XGBoost >= 1.6.0, label encoding is handled internally or not needed for numeric labels.
-        # The `use_label_encoder=False` in defaults is generally good for newer versions.
-
-        self.model = xgb.XGBClassifier(**self.params)
-        
-        eval_set_list = []
-        fit_params = {}
-
-        if X_val is not None and y_val is not None:
-            eval_set_list = [(X_val, y_val)]
-            early_stopping_rounds = kwargs.get("early_stopping_rounds", self.params.get("early_stopping_rounds", None))
-            if early_stopping_rounds:
-                fit_params["early_stopping_rounds"] = early_stopping_rounds
-                fit_params["verbose"] = False # To suppress messages from early stopping unless verbose is explicitly set in params
-        
-        print(f"Fitting XGBoostClassifier with params: {self.model.get_params()}")
-        try:
-            self.model.fit(
-                X, y, 
-                eval_set=eval_set_list if eval_set_list else None,
-                **fit_params
-            )
-            self.is_trained = True
-            print("XGBoostClassifier training completed.")
-        except Exception as e:
-            print(f"Error during XGBoostClassifier training: {e}")
-            raise
-
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        """Generates predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        try:
-            return self.model.predict(X, **kwargs)
-        except Exception as e:
-            print(f"Error during XGBoostClassifier prediction: {e}")
-            raise
-
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        """Generates probability predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        if not hasattr(self.model, "predict_proba"):
-            print(f"Model {self.model_type} does not support predict_proba.")
-            return None
-        try:
-            return self.model.predict_proba(X, **kwargs)
-        except Exception as e:
-            print(f"Error during XGBoostClassifier probability prediction: {e}")
-            raise
-
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
-        if not self.is_trained or not hasattr(self.model, 'feature_importances_'):
-            print("Model not trained or feature importances not available for XGBoost.")
-            return None
-
-        try:
-            feature_names = self.model.get_booster().feature_names
-            if feature_names is None and hasattr(X, 'columns'): # Fallback if booster names not set
-                feature_names = X.columns.tolist()
-            elif feature_names is None:
-                 feature_names = [f'feature_{i}' for i in range(len(self.model.feature_importances_))]
-
-            importances = self.model.feature_importances_
+        self.word2vec_models=word2vec_models
+        for i in range(len(self.word2vec_models)):
+            #default use_svd=False
+            if len(self.word2vec_models[i])==3:#(model,col,model_name)
+                tup=self.word2vec_models[i]
+                self.word2vec_models[i]=(tup[0],tup[1],tup[2],False)
             
-            importance_df = pd.DataFrame({
-                'feature': feature_names,
-                'importance': importances
-            }).sort_values(by='importance', ascending=False).reset_index(drop=True)
-            return importance_df
-        except Exception as e:
-            print(f"Could not retrieve feature importance for XGBoost: {e}")
-            return None
+        self.word2vec_cols=[col for (model,col,model_name,use_svd) in self.word2vec_models]#origin cols that need to use in tfidf model. 
+        self.text_cols=text_cols#extract features of words, sentences, and paragraphs from text here.
+        #to perform only one clean_text operation
+        self.param_text=list(set(self.word2vec_cols+self.text_cols))
+        
+        self.plot_feature_importance=plot_feature_importance
+        #Due to the presence of special characters in some column names, 
+        #they cannot be directly passed into the LGB model training, so conversion is required
+        self.log=log
+        self.exp_mode=exp_mode
+        #when log transform, it is necessary to ensure that the minimum value of the target is greater than 0.
+        #so target=target-min_target. b is -min_target.
+        self.exp_mode_b=0
+        if (self.objective!='regression') and (self.exp_mode==True):
+            raise ValueError("exp_mode must be False in classification task.")
+        self.use_reduce_memory=use_reduce_memory
+        self.use_data_augmentation=use_data_augmentation
+        self.use_oof_as_feature=use_oof_as_feature
+        self.use_CIR=use_CIR
+        self.use_median_as_pred=use_median_as_pred
+        self.use_scaler=use_scaler
+        self.use_eval_metric=use_eval_metric
+        self.use_TTA=use_TTA
+        self.use_spellchecker=use_spellchecker
 
-# Example of how to test this specific model
-if __name__ == '__main__':
-    from sklearn.datasets import make_classification
-    from sklearn.model_selection import train_test_split
-    import numpy as np
+        attritubes=['save_oof_preds','save_test_preds','exp_mode',
+                    'use_reduce_memory','use_data_augmentation','use_scaler',
+                    'use_oof_as_feature','use_CIR','use_median_as_pred','use_eval_metric',
+                    'use_spellchecker','use_TTA'
+                   ]
+        for attr in attritubes:
+            if getattr(self,attr) not in [True,False]:
+                raise ValueError(f"{attr} must be True or False.")
 
-    print("Testing XGBoostClassifier...")
-    X_np, y_np = make_classification(n_samples=200, n_features=20, n_informative=10, n_classes=2, random_state=42)
-    X_df = pd.DataFrame(X_np, columns=[f'feature_{i}' for i in range(X_np.shape[1])])
-    y_s = pd.Series(y_np)
+        if self.use_oof_as_feature and self.use_pseudo_label:
+            raise ValueError(f"use_oof_as_feature and use_pseudo_label cannot be both True at the same time.")
+        
+        self.feats_stat=feats_stat
+        self.target_stat=target_stat
+        #common AGGREGATIONS
+        self.AGGREGATIONS = AGGREGATIONS
+        
+        #If inference one batch of data at a time requires repeatedly loading the model,
+        #it will increase the program's running time.we need to save  in dictionary when load.
+        self.trained_models=[]#trained model
+        self.trained_CIR=[]#trained CIR model
+        self.trained_le={}
+        self.trained_wordvec={}
+        self.trained_svd={}
+        self.trained_scaler={}
+        self.trained_TE={}#TargetEncoder
+        self.onehot_valuecounts={}
+        #make folder to save model trained.such as GBDT,word2vec.
+        self.model_save_path="Zeffy_info/"
+        if not os.path.exists(self.model_save_path):
+            os.mkdir(self.model_save_path)
 
-    X_train, X_test, y_train, y_test = train_test_split(X_df, y_s, test_size=0.2, random_state=42)
-    X_train_xgb, X_val_xgb, y_train_xgb, y_val_xgb = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
+        self.eps=1e-15#clip (eps,1-eps) | divide by zero.
+        self.category_cols=[]
+        self.high_corr_cols=[]
+        #to make sure column's dtype in train.csv is same as the column's dtype in test.csv.
+        #example:https://www.kaggle.com/competitions/home-credit-credit-risk-model-stability
+        self.col2dtype={} 
+        self.weight_col=weight_col
 
-    # Binary classification test
-    print("\n--- Binary Classification Test ---")
-    xgb_clf_binary_params = {
-        "n_estimators": 50,
-        "learning_rate": 0.05,
-        "random_state": 42,
-        "objective": "binary:logistic",
-        "eval_metric": "logloss"
-    }
-    xgb_binary_model = XGBoostClassifier(model_type="xgboost_classifier", task_type="classification", params=xgb_clf_binary_params)
-    print(f"Initial params: {xgb_binary_model.params}")
-    xgb_binary_model.fit(X_train_xgb, y_train_xgb, X_val=X_val_xgb, y_val=y_val_xgb, early_stopping_rounds=10)
+    def get_params(self,):        
+        params_dict={'num_folds':self.num_folds,'n_repeats':self.n_repeats,'models':self.models,
+                     'group_col':self.group_col,'target_col':self.target_col,'weight_col':self.weight_col,
+                     'drop_cols':self.drop_cols,'seed':self.seed,'objective':self.objective,
+                     'metric':self.metric,'nan_margin':self.nan_margin,'num_classes':self.num_classes,
+                     'infer_size':self.infer_size,'save_oof_preds':self.save_oof_preds,'save_test_preds':self.save_test_preds,
+                     'device':self.device,'one_hot_max':self.one_hot_max,'custom_metric':self.custom_metric,
+                     'use_optuna_find_params':self.use_optuna_find_params,'optuna_direction':self.optuna_direction,
+                     'early_stop':self.early_stop,'use_pseudo_label':self.use_pseudo_label,
+                     'use_high_corr_feat':self.use_high_corr_feat,'cross_cols':self.cross_cols,
+                     'labelencoder_cols':self.labelencoder_cols,'list_stat':self.list_stat,
+                     'word2vec_models':self.word2vec_models, 'text_cols':self.text_cols,
+                     'plot_feature_importance':self.plot_feature_importance,'log':self.log,
+                     'exp_mode':self.exp_mode,'use_reduce_memory':self.use_reduce_memory,
+                     'use_data_augmentation':self.use_data_augmentation,
+                     'use_oof_as_feature':self.use_oof_as_feature,'use_CIR':self.use_CIR,
+                     'use_median_as_pred':self.use_median_as_pred,'use_scaler':self.use_scaler,
+                     'use_TTA':self.use_TTA,'use_eval_metric':self.use_eval_metric,
+                     'feats_stat':self.feats_stat,'target_stat':self.target_stat,
+                     'use_spellchecker':self.use_spellchecker,'AGGREGATIONS':self.AGGREGATIONS,
+                     'category_cols':self.category_cols,
+              }
+        return params_dict
     
-    binary_preds = xgb_binary_model.predict(X_test)
-    print(f"Binary predictions (first 5): {binary_preds[:5]}")
-    binary_probas = xgb_binary_model.predict_proba(X_test)
-    print(f"Binary probabilities (first 5):\n{binary_probas[:5]}")
+    #print colorful text
+    def PrintColor(self,text:str='',color = Fore.BLUE)->None:
+        print(color + text + Style.RESET_ALL)
     
-    feature_imp = xgb_binary_model.get_feature_importance()
-    if feature_imp is not None:
-        print(f"Feature importances (top 5):\n{feature_imp.head()}")
+    #save models after training
+    def pickle_dump(self,obj, path:str)->None:
+        #open path,binary write
+        with open(path, mode="wb") as f:
+            dill.dump(obj, f, protocol=4)
+    #load models when inference
+    def pickle_load(self,path:str):
+        #open path,binary read
+        with open(path, mode="rb") as f:
+            data = dill.load(f)
+            return data
 
-    # Multiclass classification test
-    print("\n--- Multiclass Classification Test ---")
-    X_multi_np, y_multi_np = make_classification(n_samples=300, n_features=20, n_informative=15, n_classes=3, random_state=42)
-    X_multi_df = pd.DataFrame(X_multi_np, columns=[f'feature_m_{i}' for i in range(X_multi_np.shape[1])])
-    y_multi_s = pd.Series(y_multi_np)
-    X_m_train, X_m_test, y_m_train, y_m_test = train_test_split(X_multi_df, y_multi_s, test_size=0.2, random_state=42)
-    X_m_train_xgb, X_m_val_xgb, y_m_train_xgb, y_m_val_xgb = train_test_split(X_m_train, y_m_train, test_size=0.25, random_state=42)
+    #sample AGGREGATIONS
+    def q1(self,x):
+        return x.quantile(0.25)
+    def q3(self,x):
+        return x.quantile(0.75)
 
-    xgb_clf_multi_params = {
-        "n_estimators": 60,
-        "learning_rate": 0.08,
-        "random_state": 123,
-        "objective": "multi:softprob", # num_class will be inferred
-        "eval_metric": "mlogloss"
-    }
-    xgb_multi_model = XGBoostClassifier(model_type="xgboost_classifier", task_type="classification", params=xgb_clf_multi_params)
-    xgb_multi_model.fit(X_m_train_xgb, y_m_train_xgb, X_val=X_m_val_xgb, y_val=y_m_val_xgb, early_stopping_rounds=5)
-
-    multi_preds = xgb_multi_model.predict(X_m_test)
-    print(f"Multiclass predictions (first 5): {multi_preds[:5]}")
-    multi_probas = xgb_multi_model.predict_proba(X_m_test)
-    print(f"Multiclass probabilities (first 5):\n{multi_probas[:5]}")
-
-    print("\nXGBoostClassifier tests finished.")
-
-
-import xgboost as xgb
-import pandas as pd
-from typing import Any, Dict, Optional
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-@register_model("xgboost_regressor")
-class XGBoostRegressor(BaseModel):
-    """XGBoost Regressor model."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params)
-        if self.task_type != "regression":
-            raise ValueError(f"XGBoostRegressor is for regression tasks, but task_type is {self.task_type}")
-        
-        self._default_params = {
-            "objective": "reg:squarederror", # Common objectives: reg:squarederror, reg:linear, reg:logistic, count:poisson
-            "eval_metric": "rmse", # Common metrics: rmse, mae
-            "n_estimators": 100,
-            "learning_rate": 0.1,
-            "max_depth": 3,
-            "random_state": self.params.get("random_state", 42),
-            "n_jobs": -1,
-        }
-        self.params = {**self._default_params, **self.params} # Merge user params with defaults
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, **kwargs) -> None:
-        """Trains the XGBoost regressor."""
-        self.model = xgb.XGBRegressor(**self.params)
-        
-        eval_set_list = []
-        fit_params = {}
-
-        if X_val is not None and y_val is not None:
-            eval_set_list = [(X_val, y_val)]
-            early_stopping_rounds = kwargs.get("early_stopping_rounds", self.params.get("early_stopping_rounds", None))
-            if early_stopping_rounds:
-                fit_params["early_stopping_rounds"] = early_stopping_rounds
-                fit_params["verbose"] = False
-        
-        print(f"Fitting XGBoostRegressor with params: {self.model.get_params()}")
-        try:
-            self.model.fit(
-                X, y, 
-                eval_set=eval_set_list if eval_set_list else None,
-                **fit_params
-            )
-            self.is_trained = True
-            print("XGBoostRegressor training completed.")
-        except Exception as e:
-            print(f"Error during XGBoostRegressor training: {e}")
-            raise
-
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        """Generates predictions."""
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        try:
-            return self.model.predict(X, **kwargs)
-        except Exception as e:
-            print(f"Error during XGBoostRegressor prediction: {e}")
-            raise
-
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        """Regressor does not support predict_proba."""
-        print(f"Model {self.model_type} (Regressor) does not support predict_proba.")
-        return None
-
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
-        if not self.is_trained or not hasattr(self.model, 'feature_importances_'):
-            print("Model not trained or feature importances not available for XGBoost Regressor.")
-            return None
-        try:
-            feature_names = self.model.get_booster().feature_names
-            if feature_names is None and hasattr(X, 'columns'): # Fallback if booster names not set
-                feature_names = X.columns.tolist()
-            elif feature_names is None:
-                 feature_names = [f'feature_{i}' for i in range(len(self.model.feature_importances_))]
-
-            importances = self.model.feature_importances_
-            
-            importance_df = pd.DataFrame({
-                'feature': feature_names,
-                'importance': importances
-            }).sort_values(by='importance', ascending=False).reset_index(drop=True)
-            return importance_df
-        except Exception as e:
-            print(f"Could not retrieve feature importance for XGBoost Regressor: {e}")
-            return None
-
-# Example of how to test this specific model
-if __name__ == '__main__':
-    from sklearn.datasets import make_regression
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import mean_squared_error
-    import numpy as np
-
-    print("Testing XGBoostRegressor...")
-    X_np, y_np = make_regression(n_samples=200, n_features=20, n_informative=10, random_state=42)
-    X_df = pd.DataFrame(X_np, columns=[f'feature_{i}' for i in range(X_np.shape[1])])
-    y_s = pd.Series(y_np)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_df, y_s, test_size=0.2, random_state=42)
-    X_train_xgb, X_val_xgb, y_train_xgb, y_val_xgb = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
-
-    xgb_reg_params = {
-        "n_estimators": 75,
-        "learning_rate": 0.07,
-        "random_state": 123,
-        "objective": "reg:squarederror",
-        "eval_metric": "rmse"
-    }
-    xgb_reg_model = XGBoostRegressor(model_type="xgboost_regressor", task_type="regression", params=xgb_reg_params)
-    print(f"Initial params: {xgb_reg_model.params}")
-    xgb_reg_model.fit(X_train_xgb, y_train_xgb, X_val=X_val_xgb, y_val=y_val_xgb, early_stopping_rounds=10)
-    
-    reg_preds = xgb_reg_model.predict(X_test)
-    print(f"Regression predictions (first 5): {reg_preds[:5]}")
-    
-    rmse = mean_squared_error(y_test, reg_preds, squared=False)
-    print(f"RMSE on test set: {rmse:.4f}")
-
-    feature_imp = xgb_reg_model.get_feature_importance()
-    if feature_imp is not None:
-        print(f"Feature importances (top 5):\n{feature_imp.head()}")
-
-    # Test predict_proba (should indicate not supported)
-    xgb_reg_model.predict_proba(X_test)
-
-    print("\nXGBoostRegressor tests finished.")
-
-
-from catboost import CatBoostClassifier as CBCModel
-import pandas as pd
-from typing import Any, Dict, Optional, List
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-@register_model("catboost_classifier")
-class CatBoostClassifier(BaseModel):
-    """CatBoost Classifier model."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params)
-        if self.task_type != "classification":
-            raise ValueError(f"CatBoostClassifier is for classification tasks, but task_type is {self.task_type}")
-        
-        self._default_params = {
-            "objective": "Logloss", # or "MultiClass"
-            "eval_metric": "AUC", # or "MultiClass"
-            "iterations": 100,
-            "learning_rate": 0.1,
-            "depth": 6,
-            "random_seed": self.params.get("random_state", self.params.get("random_seed", 42)), # CatBoost uses random_seed
-            "verbose": 0, # Suppress CatBoost verbosity by default
-            "early_stopping_rounds": None # Handled in fit method
-        }
-        # User params override defaults. If random_state is in user_params, it overrides random_seed from defaults.
-        # CatBoost uses `random_seed` not `random_state`.
-        user_params = params if params is not None else {}
-        if "random_state" in user_params and "random_seed" not in user_params:
-            user_params["random_seed"] = user_params.pop("random_state")
-        
-        self.params = {**self._default_params, **user_params}
-        if self.params["verbose"] is None or self.params["verbose"] < 100 and self.params["verbose"] !=0 : # make it less verbose unless user specified higher
-            self.params["logging_level"] = "Silent"
+    #Time data cannot use this augmentation,as features such as year, month, and day are discrete variables.
+    def pca_augmentation(self,X:pd.DataFrame,y=None,target_col:str=''):
+        if type(y)!=pd.DataFrame:#y=None
+            origin_data=X.copy()
+        else:#
+            origin_data=pd.concat((X,y),axis=1)
+        n_components=np.clip( int(origin_data.shape[1]*0.8),1,X.shape[1])
+        pca=PCA(n_components=n_components)
+        pca_data=pca.fit_transform(origin_data)
+        aug_data=pca.inverse_transform(pca_data)
+        aug_data=pd.DataFrame(aug_data)
+        if type(y)!=pd.DataFrame:#y=None
+            aug_data.columns=list(X.columns)
         else:
-            self.params["logging_level"] = "Verbose"
-
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, cat_features: Optional[List[int]] = None, **kwargs) -> None:
-        """Trains the CatBoost classifier."""
+            aug_data.columns=list(X.columns)+[target_col]
+        del origin_data,pca,pca_data
+        gc.collect()
         
-        fit_params = self.params.copy()
-        # CatBoost specific handling for early stopping
-        early_stopping_rounds_val = kwargs.get("early_stopping_rounds", fit_params.pop("early_stopping_rounds", None))
-
-        if fit_params.get("objective") == "MultiClass" and "classes_count" not in fit_params:
-            fit_params["classes_count"] = y.nunique()
-            print(f"Inferred classes_count: {fit_params['classes_count']} for multiclass CatBoost.")
-
-        self.model = CBCModel(**fit_params)
+        return aug_data
         
-        eval_set_list = None
-        if X_val is not None and y_val is not None:
-            eval_set_list = (X_val, y_val)
+    #Traverse all columns of df, modify data types to reduce memory usage
+    def reduce_mem_usage(self,df:pd.DataFrame, float16_as32:bool=True)->pd.DataFrame:
+        #memory_usage()æ˜¯dfæ¯åˆ—çš„å†…å­˜ä½¿ç”¨é‡,sumæ˜¯å¯¹å®ƒä»¬æ±‚å’Œ, B->KB->MB
+        start_mem = df.memory_usage().sum() / 1024**2
+        print('Memory usage of dataframe is {:.2f} MB'.format(start_mem))
+        for col in df.columns:
+            col_type = df[col].dtype
+            if col_type != object and str(col_type)!='category':#num_col
+                c_min,c_max = df[col].min(),df[col].max()
+                if str(col_type)[:3] == 'int':#å¦‚æžœæ˜¯intç±»åž‹çš„å˜é‡,ä¸ç®¡æ˜¯int8,int16,int32è¿˜æ˜¯int64
+                    #å¦‚æžœè¿™åˆ—çš„å–å€¼èŒƒå›´æ˜¯åœ¨int8çš„å–å€¼èŒƒå›´å†…,é‚£å°±å¯¹ç±»åž‹è¿›è¡Œè½¬æ¢ (-128 åˆ° 127)
+                    if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
+                        df[col] = df[col].astype(np.int8)
+                    #å¦‚æžœè¿™åˆ—çš„å–å€¼èŒƒå›´æ˜¯åœ¨int16çš„å–å€¼èŒƒå›´å†…,é‚£å°±å¯¹ç±»åž‹è¿›è¡Œè½¬æ¢(-32,768 åˆ° 32,767)
+                    elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
+                        df[col] = df[col].astype(np.int16)
+                    #å¦‚æžœè¿™åˆ—çš„å–å€¼èŒƒå›´æ˜¯åœ¨int32çš„å–å€¼èŒƒå›´å†…,é‚£å°±å¯¹ç±»åž‹è¿›è¡Œè½¬æ¢(-2,147,483,648åˆ°2,147,483,647)
+                    elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
+                        df[col] = df[col].astype(np.int32)
+                    #å¦‚æžœè¿™åˆ—çš„å–å€¼èŒƒå›´æ˜¯åœ¨int64çš„å–å€¼èŒƒå›´å†…,é‚£å°±å¯¹ç±»åž‹è¿›è¡Œè½¬æ¢(-9,223,372,036,854,775,808åˆ°9,223,372,036,854,775,807)
+                    elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
+                        df[col] = df[col].astype(np.int64)  
+                else:#å¦‚æžœæ˜¯æµ®ç‚¹æ•°ç±»åž‹.
+                    #å¦‚æžœæ•°å€¼åœ¨float16çš„å–å€¼èŒƒå›´å†…,å¦‚æžœè§‰å¾—éœ€è¦æ›´é«˜ç²¾åº¦å¯ä»¥è€ƒè™‘float32
+                    if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
+                        if float16_as32:#å¦‚æžœæ•°æ®éœ€è¦æ›´é«˜çš„ç²¾åº¦å¯ä»¥é€‰æ‹©float32
+                            df[col] = df[col].astype(np.float32)
+                        else:
+                            df[col] = df[col].astype(np.float16)  
+                    #å¦‚æžœæ•°å€¼åœ¨float32çš„å–å€¼èŒƒå›´å†…ï¼Œå¯¹å®ƒè¿›è¡Œç±»åž‹è½¬æ¢
+                    elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
+                        df[col] = df[col].astype(np.float32)
+                    #å¦‚æžœæ•°å€¼åœ¨float64çš„å–å€¼èŒƒå›´å†…ï¼Œå¯¹å®ƒè¿›è¡Œç±»åž‹è½¬æ¢
+                    else:
+                        df[col] = df[col].astype(np.float64)
+        #calculate memory after optimization
+        end_mem = df.memory_usage().sum() / 1024**2
+        print('Memory usage after optimization is: {:.2f} MB'.format(end_mem))
+        print('Decreased by {:.1f}%'.format(100 * (start_mem - end_mem) / start_mem))
+        return df
+
+    ############text preprocessor
+    def clean_text(self,text:str='')->str:
+        ############################## fix text #######################################################
+        #transform â€œä½ å¥½ã€‚â€ to 'NI HAO.'
+        text = unidecode(text)
+        #transform emoji to " "+text+" ".
+        text=emoji.demojize(text,delimiters=(" ", " "))
+        #correct unicode issues.
+        text=ftfy.fix_text(text)
+        #lower         example:'Big' and 'big'
+        text=text.lower()
+        ############################## remove meaningless text ########################################
+        #remove <b>  <p> meaningless
+        html=re.compile(r'<.*?>')
+        text=html.sub(r'',text)
+        #remove urls '\w+':(word character,[a-zA-Z0-9_])
+       
+        text = re.sub(r'http[s]?://(?:[a-zA-Z]|[0-9]|[$-_@.&+]|[!*\\(\\),]|(?:%[0-9a-fA-F][0-9a-fA-F]))+', '', text)
+      
+        text=re.sub("@\w+",'',text)
+        #drop single character,they are meaningless. 'space a space'
+        text=re.sub("\s[a-z]\s",'',text)
+        #remove number
+        #text=re.sub("\d+",'',text)
+        #drop english stopwords,they are meaningless.
+        english_stopwords = stopwords.words('english')
+        text_list=text.split(" ")
+        text_list=[t for t in text_list if t not in english_stopwords]
+        text=" ".join(text_list)
+        #drop space front and end.
+        text=text.strip()
+        return text
+
+    def text2word(self,text:str='hello world!'):
+        return re.split(r'\.|\?|!|\s|\n|,',text)
+    def text2sentence(self,text:str='hello world!'):
+        return re.split(r'\.|\?|\!|\n',text)
+    def text2paragraph(self,text:str='hello world!'):
+        return text.split("\n")
+    #3 text readable index 
+    def ARI(self,text):
+        characters=len(text)
+        words=len(self.text2word(text))
+        sentence=len(self.text2sentence(text))
+        ari_score=4.71*(characters/words)+0.5*(words/sentence)-21.43
+        return ari_score
+    def McAlpine_EFLAW(self,text):
+        W=len(self.text2word(text))
+        S=len(self.text2sentence(text))
+        mcalpine_eflaw_score=(W+S*W)/S
+        return mcalpine_eflaw_score
+    def CLRI(self,text):
+        characters=len(text)
+        words=len(self.text2word(text))
+        sentence=len(self.text2sentence(text))
+        L=100*characters/words
+        S=100*sentence/words
+        clri_score=0.0588*L-0.296*S-15.8
+        return clri_score
+
+    def text_correct(self,text:str='hello world!'):
+        spell = SpellChecker()
+        words = self.text2word(text)
+        punctuation=['.','?','!',' ','\n',',']
+        wordssplit=[text[i] for i in range(len(text)) if text[i] in punctuation]
+        fixed_words=[spell.correction(word) for word in words]
+        error_cnt=sum([1 for i in range(len(words)) if words[i]!=fixed_words[i]])
+        fixed_text=[]
+        for i in range(len(wordssplit)):
+            fixed_text.append(fixed_words[i])
+            fixed_text.append(wordssplit[i])
+        fixed_text="".join(fixed_text)
+        return error_cnt,fixed_text
         
-        # Identify categorical features if not provided (can be slow for many columns)
-        if cat_features is None:
-            cat_features = [i for i, col_type in enumerate(X.dtypes) if str(col_type) == "category" or X.iloc[:, i].nunique() < self.params.get("one_hot_max", 20) and X.iloc[:,i].dtype==object]
-            if cat_features:
-                print(f"Inferred categorical features indices for CatBoost: {cat_features}")
+    ############text Feature Engineer
+    def text_FE(self,df:pd.DataFrame,text_col:str='text'):
+        df['index']=np.arange(len(df))
+        #correct text
+        if self.use_spellchecker:
+            self.PrintColor(f"-> for column {text_col} text correct",color=Fore.YELLOW)
+            texts=df[text_col].values
+            error_cnts=np.zeros(len(texts))
+            for i in tqdm(range(len(texts))):
+                error_cnts[i],texts[i]=self.text_correct(texts[i])
+            df[f'{text_col}_error_cnts']=error_cnts
+        
+        df[text_col+"_ARI"]=df[text_col].apply(lambda x:self.ARI(x))
+        df[text_col+"_CLRI"]=df[text_col].apply(lambda x:self.CLRI(x))
+        df[text_col+"_McAlpine_EFLAW"]=df[text_col].apply(lambda x:self.McAlpine_EFLAW(x))
+        #split by ps
+        ps='!"#$%&\'()*+,-./:;<=>?@[\\]^_`{|}~'
+        for i in range(len(ps)):
+            df[text_col+f"split_ps{i}_count"]=df[text_col].apply(lambda x:len(x.split(ps[i])))
 
-        print(f"Fitting CatBoostClassifier with effective params: {self.model.get_params()}")
-        try:
-            self.model.fit(
-                X, y, 
-                eval_set=eval_set_list,
-                cat_features=cat_features if cat_features else None,
-                early_stopping_rounds=early_stopping_rounds_val,
-                # verbose is controlled by logging_level in params for CatBoost
-            )
-            self.is_trained = True
-            print("CatBoostClassifier training completed.")
-        except Exception as e:
-            print(f"Error during CatBoostClassifier training: {e}")
-            raise
+        self.PrintColor(f"-> for column {text_col} word feature",color=Fore.RED)
+        text_col_word_df=df[['index',text_col]].copy()
+        #get word_list   [index,tcol,word_list]
+        text_col_word_df[f'{text_col}_word']=text_col_word_df[text_col].apply(lambda x:self.text2word(x))
+        #[index,single_word]
+        text_col_word_df=text_col_word_df.explode(f'{text_col}_word')[['index',f'{text_col}_word']]
+        #[index,single_word,single_word_len]
+        text_col_word_df[f'{text_col}_word_len'] = text_col_word_df[f'{text_col}_word'].apply(len)
+        #data clean [index,single_word,single_word_len]
+        text_col_word_df=text_col_word_df[text_col_word_df[f'{text_col}_word_len']!=0]
+        #for word features, extract the difference in length between the two words before and after.
+        group_cols=[f'{text_col}_word_len']
+        for gap in [1]:
+            for col in [f'{text_col}_word_len']:
+                text_col_word_df[f'{col}_diff{gap}']=text_col_word_df.groupby(['index'])[col].diff(gap)
+                group_cols.append(f'{col}_diff{gap}')
+        text_col_word_agg_df = text_col_word_df[['index']+group_cols].groupby(['index']).agg(self.AGGREGATIONS)
+        text_col_word_agg_df.columns = ['_'.join(x) for x in text_col_word_agg_df.columns]
+        df=df.merge(text_col_word_agg_df,on='index',how='left')
 
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        try:
-            return self.model.predict(X, **kwargs)
-        except Exception as e:
-            print(f"Error during CatBoostClassifier prediction: {e}")
-            raise
+        self.PrintColor(f"-> for column {text_col} sentence feature",color=Fore.RED)
+        text_col_sent_df=df[['index',text_col]].copy()
+        #get sent_list   [index,tcol,sent_list]
+        text_col_sent_df[f'{text_col}_sent']=text_col_sent_df[text_col].apply(lambda x: self.text2sentence(x))
+        #[index,single_sent]
+        text_col_sent_df=text_col_sent_df.explode(f'{text_col}_sent')[['index',f'{text_col}_sent']]
+        #[index,single_sent,single_sent_len]
+        text_col_sent_df[f'{text_col}_sent_len'] = text_col_sent_df[f'{text_col}_sent'].apply(len)
+        text_col_sent_df[f'{text_col}_sent_word_count'] = text_col_sent_df[f'{text_col}_sent'].apply(lambda x:len(re.split('\\ |\\,',x)))
+        #data clean [index,single_sent,single_sent_len]
+        group_cols=[f'{text_col}_sent_len',f'{text_col}_sent_word_count']
+        for gcol in group_cols:
+            text_col_sent_df=text_col_sent_df[text_col_sent_df[gcol]!=0]
+        #for sent features, extract the difference in length between the two sents before and after.
+        for gap in [1]:
+            for col in [f'{text_col}_sent_len',f'{text_col}_sent_word_count']:
+                text_col_sent_df[f'{col}_diff{gap}']=text_col_sent_df.groupby(['index'])[col].diff(gap)
+                group_cols.append(f'{col}_diff{gap}')
+        text_col_sent_agg_df = text_col_sent_df[['index']+group_cols].groupby(['index']).agg(self.AGGREGATIONS)
+        text_col_sent_agg_df.columns = ['_'.join(x) for x in text_col_sent_agg_df.columns]
+        df=df.merge(text_col_sent_agg_df,on='index',how='left')
 
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        if not hasattr(self.model, "predict_proba"):
-            print(f"Model {self.model_type} does not support predict_proba.")
-            return None
-        try:
-            return self.model.predict_proba(X, **kwargs)
-        except Exception as e:
-            print(f"Error during CatBoostClassifier probability prediction: {e}")
-            raise
+        self.PrintColor(f"-> for column {text_col} paragraph feature",color=Fore.RED)
+        text_col_para_df=df[['index',text_col]].copy()
+        #get para_list   [index,tcol,para_list]
+        text_col_para_df[f'{text_col}_para']=text_col_para_df[text_col].apply(lambda x: self.text2paragraph(x))
+        #[index,single_para]
+        text_col_para_df=text_col_para_df.explode(f'{text_col}_para')[['index',f'{text_col}_para']]
+        text_col_para_df[f'{text_col}_para_len'] = text_col_para_df[f'{text_col}_para'].apply(len)
+        text_col_para_df[f'{text_col}_para_sent_count'] = text_col_para_df[f'{text_col}_para'].apply(lambda x: len(re.split('\\.|\\?|\\!',x)))
+        text_col_para_df[f'{text_col}_para_word_count'] = text_col_para_df[f'{text_col}_para'].apply(lambda x: len(re.split('\\.|\\?|\\!\\ |\\,',x)))
+        #data clean [index,single_sent,single_sent_len]
+        group_cols=[f'{text_col}_para_len',f'{text_col}_para_sent_count',f'{text_col}_para_word_count']
+        for gcol in group_cols:
+            text_col_para_df=text_col_para_df[text_col_para_df[gcol]!=0]
+        #for sent features, extract the difference in length between the two sents before and after.
+        for gap in [1]:
+            for col in [f'{text_col}_para_len',f'{text_col}_para_sent_count',f'{text_col}_para_word_count']:
+                text_col_para_df[f'{col}_diff{gap}']=text_col_para_df.groupby(['index'])[col].diff(gap)
+                group_cols.append(f'{col}_diff{gap}')
+        text_col_para_agg_df = text_col_para_df[['index']+group_cols].groupby(['index']).agg(self.AGGREGATIONS)
+        text_col_para_agg_df.columns = ['_'.join(x) for x in text_col_para_agg_df.columns]
+        df=df.merge(text_col_para_agg_df,on='index',how='left') 
+        df.drop(['index'],axis=1,inplace=True)
+        return df
+        
+    #basic Feature Engineer,mode='train' or 'test' ,drop_cols is other cols you want to delete.
+    def base_FE(self,df:pd.DataFrame,mode:str='train',drop_cols:list[str]=[])->pd.DataFrame:
+        if self.FE!=None:
+            #use your custom metric first
+            df=self.FE(df)
 
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
-        if not self.is_trained or not hasattr(self.model, "get_feature_importance"):
-            print("Model not trained or feature importances not available for CatBoost.")
-            return None
-        try:
-            feature_names = self.model.feature_names_ if self.model.feature_names_ else [f"feature_{i}" for i in range(len(self.model.get_feature_importance()))]
-            importances = self.model.get_feature_importance()
+        #clean text
+        for pt_col in tqdm(self.param_text):
+            self.PrintColor(f"-> for column {pt_col} text clean",color=Fore.YELLOW)
+            df[pt_col]=(df[pt_col].fillna('nan'))
+            if df[pt_col].nunique()>0.5*len(df):
+                df[pt_col]=df[pt_col].apply(lambda x:self.clean_text(x))
+            else:#use dict to clean,save time.
+                text2clean={}
+                for text in df[pt_col].unique():
+                    text2clean[text]=self.clean_text(text)
+                df[pt_col]=df[pt_col].apply(lambda x:text2clean.get(x,'nan'))
+                del text2clean
+                gc.collect()
+        
+        #text feature extract,such as word,sentence,paragraph.
+        #The reason why it needs to be done earlier is that it will generate columns such as nunique=1 or
+        #object that need to be dropped, so it needs to be placed before finding these columns.
+        if len(self.text_cols):
+            print("< text column's feature >")
+            for tcol in self.text_cols:
+                #category text
+                if df[tcol].nunique()<0.5*len(df):
+                    text_map_df=pd.DataFrame({tcol:df[tcol].unique()})
+                    text_agg_df=self.text_FE(text_map_df,tcol)
+                    df=df.merge(text_agg_df,on=tcol,how='left')
+                else:
+                    df=self.text_FE(df,tcol)
+        
+        if mode=='train':
+            #missing value 
+            self.nan_cols=[col for col in df.columns if df[col].isna().mean()>self.nan_margin]
             
-            importance_df = pd.DataFrame({
-                "feature": feature_names,
-                "importance": importances
-            }).sort_values(by="importance", ascending=False).reset_index(drop=True)
-            return importance_df
-        except Exception as e:
-            print(f"Could not retrieve feature importance for CatBoost: {e}")
-            return None
-
-# if __name__ == "__main__": # Zeffy: Main block from module, commented out.
-    from sklearn.datasets import make_classification
-    from sklearn.model_selection import train_test_split
-
-    print("Testing CatBoostClassifier...")
-    X_np, y_np = make_classification(n_samples=200, n_features=20, n_informative=10, n_classes=2, random_state=42)
-    X_df = pd.DataFrame(X_np, columns=[f"feature_{i}" for i in range(X_np.shape[1])])
-    # Make some features categorical for CatBoost to handle
-    X_df["feature_cat_1"] = pd.Series(np.random.choice(["A", "B", "C"], size=len(X_df))).astype("category")
-    X_df["feature_cat_2"] = pd.Series(np.random.choice(["X", "Y"], size=len(X_df))).astype("category")
-    y_s = pd.Series(y_np)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_df, y_s, test_size=0.2, random_state=42)
-    X_train_cb, X_val_cb, y_train_cb, y_val_cb = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
-
-    print("\n--- Binary Classification Test ---")
-    cb_clf_binary_params = {
-        "iterations": 50,
-        "learning_rate": 0.05,
-        "random_seed": 42,
-        "objective": "Logloss",
-        "eval_metric": "Logloss,AUC",
-        "verbose": 0 # Keep it silent for tests
-    }
-    cb_binary_model = CatBoostClassifier(model_type="catboost_classifier", task_type="classification", params=cb_clf_binary_params)
-    cb_binary_model.fit(X_train_cb, y_train_cb, X_val=X_val_cb, y_val=y_val_cb, early_stopping_rounds=10)
-    
-    binary_preds = cb_binary_model.predict(X_test)
-    print(f"Binary predictions (first 5): {binary_preds[:5].flatten().tolist()}")
-    binary_probas = cb_binary_model.predict_proba(X_test)
-    print(f"Binary probabilities (first 5):\n{binary_probas[:5]}")
-    
-    feature_imp = cb_binary_model.get_feature_importance()
-    if feature_imp is not None:
-        print(f"Feature importances (top 5):\n{feature_imp.head()}")
-
-    print("\n--- Multiclass Classification Test ---")
-    X_multi_np, y_multi_np = make_classification(n_samples=300, n_features=20, n_informative=15, n_classes=3, random_state=42)
-    X_multi_df = pd.DataFrame(X_multi_np, columns=[f"feature_m_{i}" for i in range(X_multi_np.shape[1])])
-    X_multi_df["feature_m_cat_1"] = pd.Series(np.random.choice(["P", "Q", "R", "S"], size=len(X_multi_df))).astype("category")
-    y_multi_s = pd.Series(y_multi_np)
-    X_m_train, X_m_test, y_m_train, y_m_test = train_test_split(X_multi_df, y_multi_s, test_size=0.2, random_state=42)
-    X_m_train_cb, X_m_val_cb, y_m_train_cb, y_m_val_cb = train_test_split(X_m_train, y_m_train, test_size=0.25, random_state=42)
-
-    cb_clf_multi_params = {
-        "iterations": 60,
-        "learning_rate": 0.08,
-        "random_seed": 123,
-        "objective": "MultiClass",
-        "eval_metric": "MultiClass",
-        "verbose": 0
-    }
-    cb_multi_model = CatBoostClassifier(model_type="catboost_classifier", task_type="classification", params=cb_clf_multi_params)
-    cb_multi_model.fit(X_m_train_cb, y_m_train_cb, X_val=X_m_val_cb, y_val=y_m_val_cb, early_stopping_rounds=5)
-
-    multi_preds = cb_multi_model.predict(X_m_test)
-    print(f"Multiclass predictions (first 5): {multi_preds[:5].flatten().tolist()}")
-    multi_probas = cb_multi_model.predict_proba(X_m_test)
-    print(f"Multiclass probabilities (first 5):\n{multi_probas[:5]}")
-
-    print("\nCatBoostClassifier tests finished.")
-
-from catboost import CatBoostRegressor as CBRModel
-import pandas as pd
-from typing import Any, Dict, Optional, List
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-@register_model("catboost_regressor")
-class CatBoostRegressor(BaseModel):
-    """CatBoost Regressor model."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params)
-        if self.task_type != "regression":
-            raise ValueError(f"CatBoostRegressor is for regression tasks, but task_type is {self.task_type}")
-        
-        self._default_params = {
-            "objective": "RMSE", # Common objectives: RMSE, MAE, Quantile, LogLinQuantile, Poisson, MAPE
-            "eval_metric": "RMSE",
-            "iterations": 100,
-            "learning_rate": 0.1,
-            "depth": 6,
-            "random_seed": self.params.get("random_state", self.params.get("random_seed", 42)),
-            "verbose": 0,
-            "early_stopping_rounds": None
-        }
-        user_params = params if params is not None else {}
-        if "random_state" in user_params and "random_seed" not in user_params:
-            user_params["random_seed"] = user_params.pop("random_state")
-
-        self.params = {**self._default_params, **user_params}
-        if self.params["verbose"] is None or self.params["verbose"] < 100 and self.params["verbose"] !=0:
-            self.params["logging_level"] = "Silent"
-        else:
-            self.params["logging_level"] = "Verbose"
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, cat_features: Optional[List[int]] = None, **kwargs) -> None:
-        """Trains the CatBoost regressor."""
-        fit_params = self.params.copy()
-        early_stopping_rounds_val = kwargs.get("early_stopping_rounds", fit_params.pop("early_stopping_rounds", None))
-
-        self.model = CBRModel(**fit_params)
-        
-        eval_set_list = None
-        if X_val is not None and y_val is not None:
-            eval_set_list = (X_val, y_val)
-
-        if cat_features is None:
-            cat_features = [i for i, col_type in enumerate(X.dtypes) if str(col_type) == "category" or X.iloc[:, i].nunique() < self.params.get("one_hot_max", 20) and X.iloc[:,i].dtype==object]
-            if cat_features:
-                print(f"Inferred categorical features indices for CatBoost Regressor: {cat_features}")
-
-        print(f"Fitting CatBoostRegressor with effective params: {self.model.get_params()}")
-        try:
-            self.model.fit(
-                X, y, 
-                eval_set=eval_set_list,
-                cat_features=cat_features if cat_features else None,
-                early_stopping_rounds=early_stopping_rounds_val,
-            )
-            self.is_trained = True
-            print("CatBoostRegressor training completed.")
-        except Exception as e:
-            print(f"Error during CatBoostRegressor training: {e}")
-            raise
-
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        try:
-            return self.model.predict(X, **kwargs)
-        except Exception as e:
-            print(f"Error during CatBoostRegressor prediction: {e}")
-            raise
-
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        print(f"Model {self.model_type} (Regressor) does not support predict_proba.")
-        return None
-
-    def get_feature_importance(self) -> Optional[pd.DataFrame]:
-        if not self.is_trained or not hasattr(self.model, "get_feature_importance"):
-            print("Model not trained or feature importances not available for CatBoost Regressor.")
-            return None
-        try:
-            feature_names = self.model.feature_names_ if self.model.feature_names_ else [f"feature_{i}" for i in range(len(self.model.get_feature_importance()))]
-            importances = self.model.get_feature_importance()
+            #nunique=1
+            self.unique_cols=[]
+            for col in df.drop(self.drop_cols+self.list_cols+\
+                               [self.weight_col,self.group_col,self.target_col],axis=1,errors='ignore').columns:
+                if(df[col].nunique()<2):#maybe np.nan
+                    self.unique_cols.append(col)
+                #max_value_counts's count
+                elif len(list(df[col].value_counts().to_dict().items()))>0:
+                    if list(df[col].value_counts().to_dict().items())[0][1]>=len(df)*0.99:
+                        self.unique_cols.append(col)
+                #num_cols and low_var
+                elif (df[col].dtype!=object) and (df[col].std()/df[col].mean()<0.01):
+                    self.unique_cols.append(col)        
             
-            importance_df = pd.DataFrame({
-                "feature": feature_names,
-                "importance": importances
-            }).sort_values(by="importance", ascending=False).reset_index(drop=True)
-            return importance_df
-        except Exception as e:
-            print(f"Could not retrieve feature importance for CatBoost Regressor: {e}")
-            return None
-
-# if __name__ == "__main__": # Zeffy: Main block from module, commented out.
-    from sklearn.datasets import make_regression
-    from sklearn.model_selection import train_test_split
-    from sklearn.metrics import mean_squared_error
-
-    print("Testing CatBoostRegressor...")
-    X_np, y_np = make_regression(n_samples=200, n_features=20, n_informative=10, random_state=42)
-    X_df = pd.DataFrame(X_np, columns=[f"feature_{i}" for i in range(X_np.shape[1])])
-    X_df["feature_cat_reg_1"] = pd.Series(np.random.choice(["GroupA", "GroupB"], size=len(X_df))).astype("category")
-    y_s = pd.Series(y_np)
-
-    X_train, X_test, y_train, y_test = train_test_split(X_df, y_s, test_size=0.2, random_state=42)
-    X_train_cb, X_val_cb, y_train_cb, y_val_cb = train_test_split(X_train, y_train, test_size=0.25, random_state=42)
-
-    cb_reg_params = {
-        "iterations": 75,
-        "learning_rate": 0.07,
-        "random_seed": 123,
-        "objective": "RMSE",
-        "eval_metric": "RMSE",
-        "verbose": 0
-    }
-    cb_reg_model = CatBoostRegressor(model_type="catboost_regressor", task_type="regression", params=cb_reg_params)
-    cb_reg_model.fit(X_train_cb, y_train_cb, X_val=X_val_cb, y_val=y_val_cb, early_stopping_rounds=10)
-    
-    reg_preds = cb_reg_model.predict(X_test)
-    print(f"Regression predictions (first 5): {reg_preds[:5]}")
-    
-    rmse = mean_squared_error(y_test, reg_preds, squared=False)
-    print(f"RMSE on test set: {rmse:.4f}")
-
-    feature_imp = cb_reg_model.get_feature_importance()
-    if feature_imp is not None:
-        print(f"Feature importances (top 5):\n{feature_imp.head()}")
-
-    print("\nCatBoostRegressor tests finished.")
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
-import pandas as pd
-import numpy as np
-from typing import Any, Dict, Optional, Union, Type
-import importlib.util
-import sys
-
-# from ..base_model import BaseModel # Zeffy: Relative import handled by consolidation order
-# from ..registry import register_model # Zeffy: Relative import handled by consolidation order
-
-# Helper function to load a PyTorch model class from a file path
-def load_pytorch_model_class_from_file(file_path: str, class_name: str) -> Type[nn.Module]:
-    """Loads a PyTorch nn.Module class from a Python file."""
-    try:
-        spec = importlib.util.spec_from_file_location(f"custom_torch_module.{class_name}", file_path)
-        if spec is None or spec.loader is None:
-            raise ImportError(f"Could not load spec for module at {file_path}")
-        custom_module = importlib.util.module_from_spec(spec)
-        sys.modules[spec.name] = custom_module # Add to sys.modules before exec_module
-        spec.loader.exec_module(custom_module)
-        model_class = getattr(custom_module, class_name)
-        if not issubclass(model_class, nn.Module):
-            raise TypeError(f"Class {class_name} from {file_path} is not a subclass of torch.nn.Module")
-        return model_class
-    except Exception as e:
-        print(f"Error loading PyTorch model class 	hemed_text_color_red_bold_start_bold_end_themed_text_color_end{class_name}	hemed_text_color_red_bold_start_bold_end_themed_text_color_end from 	hemed_text_color_red_bold_start_bold_end_themed_text_color_end{file_path}	hemed_text_color_red_bold_start_bold_end_themed_text_color_end: {e}")
-        raise
-
-@register_model("pytorch_tabular_nn")
-class PyTorchTabularNN(BaseModel):
-    """PyTorch Neural Network model for tabular data."""
-
-    def __init__(self, model_type: str, task_type: str, params: Optional[Dict[str, Any]] = None):
-        super().__init__(model_type, task_type, params if params else {})
+            #object dtype
+            self.object_cols=[col for col in df.drop(self.drop_cols+self.category_cols,axis=1,errors='ignore').columns if (df[col].dtype==object) and (col not in [self.group_col,self.target_col])]
+            #one_hot_cols
+            self.one_hot_cols=[]
+            self.nunique2_cols=[]
+            for col in df.drop(
+                [self.target_col,self.group_col,self.weight_col]+\
+                self.list_cols+self.drop_cols
+                ,axis=1,errors='ignore'
+            ).columns:
+                if (df[col].dtype==object) and not (
+                    #such as sin_month,month have already been onehot.
+                    col.startswith('sin') or col.startswith('cos') or
+                    #AGGREGATION don't use onehot.
+                    col.endswith('_nunique') or col.endswith('_count') or
+                    col.endswith('_min') or col.endswith('_max') or 
+                    col.endswith('_first') or col.endswith('_last') or
+                    col.endswith('_mean') or col.endswith('_median') or 
+                    col.endswith('_sum') or col.endswith('_std') or col.endswith('_skew') or 
+                    #q0:0.05,q1:0.25,q2:0.5,q3:0.75,q4:0.95
+                    col.endswith('_kurtosis') or col.endswith('_q0') or col.endswith('_q1') or
+                    col.endswith('_q2') or col.endswith('_q3') or col.endswith('_q4')
+                    ):
+                    if (df[col].nunique()<self.one_hot_max) and (df[col].nunique()>2):
+                        self.one_hot_cols.append([col,list(df[col].value_counts().to_dict().keys())]) 
+                    elif (self.one_hot_max>=2) and (df[col].nunique()==2):
+                        self.nunique2_cols.append([col,list(df[col].unique())[0]])
         
-        self._default_nn_params = {
-            "architecture_definition": None, # Can be a class, path to .py file, or dict for predefined
-            "architecture_class_name": "CustomNet", # If loading from file
-            "input_features": None, # Must be set or inferred
-            "output_features": None, # Must be set or inferred (1 for regression/binary, n_classes for multiclass)
-            "epochs": 10,
-            "batch_size": 32,
-            "learning_rate": 1e-3,
-            "optimizer_name": "Adam",
-            "loss_function_name": None, # Will be inferred based on task_type if None
-            "device": "cpu", # or "cuda" if available and configured
-            "pretrained_model_path": None,
-            "fine_tune": False, # If true, only last layer might be unfrozen or specific layers
-            "model_kwargs": {} # Additional kwargs for the nn.Module constructor
-        }
-        self.params = {**self._default_nn_params, **self.params}
+        df=pl.from_pandas(df)
+        if self.one_hot_max>1:
+            print("< one hot encoder >")          
+            for i in range(len(self.one_hot_cols)):
+                col,nunique=self.one_hot_cols[i]
+                for u in nunique:
+                    df=df.with_columns((pl.col(col)==u).cast(pl.Int8).alias(f"{col}_{u}"))
+                #one_hot_value_count
+                try:
+                    col_valuecounts=self.onehot_valuecounts[col]
+                except:
+                    col_valuecounts=df[col].value_counts().to_dict()
+                    new_col_valuecounts={}
+                    for k,v in zip(col_valuecounts[col],col_valuecounts['count']):
+                        new_col_valuecounts[k]=v
+                    col_valuecounts=new_col_valuecounts
+                    self.onehot_valuecounts[col]=col_valuecounts
+                df=df.with_columns(pl.col(col).replace(col_valuecounts,default=np.nan).alias(col+"_valuecounts"))
+                df=df.with_columns((pl.col(col+"_valuecounts")>=5)*pl.col(col+"_valuecounts"))    
+            for i in range(len(self.nunique2_cols)):
+                c,u=self.nunique2_cols[i]
+                df=df.with_columns((pl.col(c)==u).cast(pl.Int8).alias(f"{c}_{u}"))
+        df=df.to_pandas()
 
-        if self.params["device"] == "cuda" and not torch.cuda.is_available():
-            print("Warning: CUDA requested but not available. Falling back to CPU.")
-            self.params["device"] = "cpu"
-        self.device = torch.device(self.params["device"])
-
-        self.model_definition_class: Optional[Type[nn.Module]] = None
-        self._initialize_model_definition()
-        self.optimizer: Optional[optim.Optimizer] = None
-        self.criterion: Optional[nn.Module] = None
-
-    def _initialize_model_definition(self):
-        arch_def = self.params.get("architecture_definition")
-        arch_class_name = self.params.get("architecture_class_name", "CustomNet")
-
-        if isinstance(arch_def, type) and issubclass(arch_def, nn.Module):
-            self.model_definition_class = arch_def
-        elif isinstance(arch_def, str): # Path to a .py file
-            try:
-                self.model_definition_class = load_pytorch_model_class_from_file(arch_def, arch_class_name)
-            except Exception as e:
-                raise ValueError(f"Failed to load model architecture from file {arch_def}: {e}")
-        elif isinstance(arch_def, dict): # Predefined architecture from dict (e.g. simple MLP)
-            # This part can be expanded to build a model from a dictionary definition
-            print("Warning: Dictionary-based architecture definition is not fully implemented yet. Please provide a class or .py file path.")
-            # As a placeholder, one could define a default MLP here if arch_def specifies it
-            # For now, we require a class or file.
-            raise NotImplementedError("Dictionary-based architecture definition is a TODO.")
-        elif arch_def is None:
-            print("Warning: No architecture_definition provided. A default simple MLP will be used if input/output features are known.")
-            # Define a very simple default MLP if needed, or raise error if not enough info
-        else:
-            raise TypeError("architecture_definition must be a nn.Module class, a path to a .py file, or a configuration dictionary.")
-
-    def _setup_model_components(self, X: pd.DataFrame, y: pd.Series):
-        if self.params["input_features"] is None:
-            self.params["input_features"] = X.shape[1]
+        #category columns
+        for col in self.category_cols:
+            #preprocessing
+            df[col]=df[col].apply(lambda x:str(x).lower())
+            df=self.label_encoder(df,label_encoder_cols=[col],fold=self.num_folds)
+            df[col]=df[col].astype('category')
         
-        if self.task_type == "classification":
-            num_classes = y.nunique()
-            if self.params["output_features"] is None:
-                self.params["output_features"] = 1 if num_classes == 2 else num_classes
+        if len(self.list_stat):
+            print("< list column's feature >")
+            for (l_col,l_gaps) in self.list_stat:
+                try:#if str(list),transform '[a,b]' to [a,b]
+                    df[l_col]=df[l_col].apply(lambda x:ast.literal_eval(x))
+                except:#origin data is list or data can't be parsed.
+                    #<class 'numpy.ndarray'> [10103]
+                    if not isinstance(list(df[l_col].dropna().values[0]),list):
+                        raise ValueError(f"col '{l_col}' is not a list.")
+                
+                #add index,data of list can groupby index.
+                df['index']=np.arange(len(df))
+                #construct origin feats 
+                list_col_df=df.copy().explode(l_col)[['index',l_col]]
+                list_col_df[l_col]=list_col_df[l_col].astype(np.float32)
+
+                group_cols=[l_col]
+                for gap in l_gaps:
+                    self.PrintColor(f"-> for column {l_col} gap{gap}",color=Fore.RED)
+                    list_col_df[f"{l_col}_gap{gap}"]=list_col_df.groupby(['index'])[l_col].diff(gap)
+                    group_cols.append( f"{l_col}_gap{gap}" )
+
+                list_col_agg_df = list_col_df[['index']+group_cols].groupby(['index']).agg(self.AGGREGATIONS)
+                list_col_agg_df.columns = ['_'.join(x) for x in list_col_agg_df.columns]
+                df=df.merge(list_col_agg_df,on='index',how='left')
+                df[f'{l_col}_len']=df[l_col].apply(len)
+                
+                for gcol in group_cols:
+                    if (f'{gcol}_max' in df.columns) and (f'{gcol}_min' in df.columns):
+                        df[f'{gcol}_ptp']=df[f'{gcol}_max']-df[f'{gcol}_min']
+                    if (f'{gcol}_mean' in df.columns) and (f'{gcol}_std' in df.columns):
+                        df[f'{gcol}_mean_divide_{gcol}_std']=df[f'{gcol}_mean']/(df[f'{gcol}_std']+self.eps)
+
+                col_list=df[l_col].values
+                max_k=10
+                res=[]
+                for i in range(len(df)):
+                    #{1:count2,2:count4,3:count1}
+                    vs,cs = np.unique(col_list[i], return_counts=True)
+                    res_=[]
+                    for k in range(max_k):
+                        res_.append(np.sum(cs==k+1))
+                    res.append(res_)
+                res=np.array(res)
+                for k in range(max_k):
+                    df[f"{l_col}_valuecount_equal{k+1}_cnt"]=res[:,k]
+                
+                #drop index after using.
+                df.drop(['index'],axis=1,inplace=True)
+
+        if len(self.feats_stat):
+            print("< groupby feature >")
+            for items in tqdm(self.feats_stat):
+                group_col,feature_col,AGGREGATIONS=items
+                #simple agg or cross agg
+                agg1,agg2=[],[]
+                for agg in AGGREGATIONS:
+                    if type(agg)==str:
+                        agg_name=agg
+                    else:#function
+                        agg_name=agg.__name__
+                    if ('+' in agg_name) or ('-' in agg_name) or ('*' in agg_name) or ('/' in agg_name):
+                        agg2.append(agg)
+                    else:
+                        agg1.append(agg)
+                if type(group_col)==str:
+                    choose_cols=[group_col,feature_col]
+                else:#such as list
+                    choose_cols=group_col+[feature_col]
+                #deal with agg1
+                agg_df = df[choose_cols].groupby(group_col).agg(agg1)
+                agg_df.columns = ['_'.join(x) for x in agg_df.columns]
+                df=df.merge(agg_df,on=group_col,how='left')
+                #deal with agg2
+                for agg in agg2:
+                    if agg=='max-min':
+                        if f'{feature_col}_max' in df.columns and f'{feature_col}_min' in df.columns:
+                            df[f'{feature_col}_ptp']=df[f'{feature_col}_max']-df[f'{feature_col}_min']
+                        else:
+                            raise ValueError(f"max and min must in {feature_col}'s AGGREGATIONS.")
             
-            if self.params["loss_function_name"] is None:
-                self.criterion = nn.BCEWithLogitsLoss() if self.params["output_features"] == 1 else nn.CrossEntropyLoss()
-            # Add more loss functions here (e.g., FocalLoss)
-        elif self.task_type == "regression":
-            if self.params["output_features"] is None:
-                self.params["output_features"] = 1
-            if self.params["loss_function_name"] is None:
-                self.criterion = nn.MSELoss()
-            # Add more loss functions (MAE, Huber, etc.)
-        else:
-            raise ValueError(f"Unsupported task_type for PyTorchTabularNN: {self.task_type}")
+                    elif agg=='mean/std':
+                        if f'{feature_col}_mean' in df.columns and f'{feature_col}_std' in df.columns:
+                            df[f'{feature_col}_mean_divide_std']=df[f'{feature_col}_mean']/(df[f'{feature_col}_std']+self.eps)
+                        else:
+                            raise ValueError(f"mean and std must in {feature_col}'s AGGREGATIONS.")
 
-        if self.model_definition_class:
-            model_kwargs = self.params.get("model_kwargs", {})
-            self.model = self.model_definition_class(
-                input_dim=self.params["input_features"],
-                output_dim=self.params["output_features"],
-                **model_kwargs
-            ).to(self.device)
-        elif self.params["input_features"] and self.params["output_features"]:
-            # Fallback to a very simple default MLP if no architecture was provided but we have I/O dims
-            print('Using default SimpleMLP with input_dim={}, output_dim={}'.format(self.params["input_features"], self.params["output_features"]))
-            self.model = SimpleMLP(input_dim=self.params["input_features"], output_dim=self.params["output_features"]).to(self.device)
-        else:
-            raise ValueError("Cannot initialize model: input_features and output_features must be set, or a valid model_definition_class provided.")
-
-        # Load pretrained weights if path is provided
-        pretrained_path = self.params.get("pretrained_model_path")
-        if pretrained_path:
-            try:
-                self.model.load_state_dict(torch.load(pretrained_path, map_location=self.device))
-                print(f"Loaded pretrained model weights from {pretrained_path}")
-                if self.params.get("fine_tune"):
-                    # Implement fine-tuning logic (e.g., freeze some layers)
-                    print("Fine-tuning enabled. (Actual layer freezing logic to be implemented)")
-                    for param in self.model.parameters(): # Example: freeze all by default
-                        param.requires_grad = False
-                    # Unfreeze last layer or specific layers based on config
-                    # e.g., if hasattr(self.model, 'fc'): for param in self.model.fc.parameters(): param.requires_grad = True 
-            except Exception as e:
-                print(f"Error loading pretrained model from {pretrained_path}: {e}. Training from scratch.")
-
-        # Optimizer
-        optimizer_name = self.params.get("optimizer_name", "Adam").lower()
-        lr = self.params.get("learning_rate", 1e-3)
-        if optimizer_name == "adam":
-            self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        elif optimizer_name == "sgd":
-            self.optimizer = optim.SGD(self.model.parameters(), lr=lr, momentum=0.9)
-        # Add more optimizers (AdamW, RMSprop, etc.)
-        else:
-            raise ValueError(f"Unsupported optimizer: {optimizer_name}")
-
-    def fit(self, X: pd.DataFrame, y: pd.Series, X_val: Optional[pd.DataFrame] = None, y_val: Optional[pd.Series] = None, **kwargs) -> None:
-        self._setup_model_components(X, y)
-        if self.model is None or self.optimizer is None or self.criterion is None:
-            raise RuntimeError("Model, optimizer, or criterion not initialized properly.")
-
-        X_tensor = torch.tensor(X.values, dtype=torch.float32).to(self.device)
-        if self.task_type == "classification" and self.params["output_features"] > 1: # CrossEntropyLoss expects class indices
-             y_tensor = torch.tensor(y.values, dtype=torch.long).to(self.device)
-        else: # BCEWithLogitsLoss or MSELoss expect float targets
-             y_tensor = torch.tensor(y.values, dtype=torch.float32).unsqueeze(1).to(self.device)
-
-        train_dataset = TensorDataset(X_tensor, y_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=self.params["batch_size"], shuffle=True)
-
-        val_loader = None
-        if X_val is not None and y_val is not None:
-            X_val_tensor = torch.tensor(X_val.values, dtype=torch.float32).to(self.device)
-            if self.task_type == "classification" and self.params["output_features"] > 1:
-                y_val_tensor = torch.tensor(y_val.values, dtype=torch.long).to(self.device)
-            else:
-                y_val_tensor = torch.tensor(y_val.values, dtype=torch.float32).unsqueeze(1).to(self.device)
-            val_dataset = TensorDataset(X_val_tensor, y_val_tensor)
-            val_loader = DataLoader(val_dataset, batch_size=self.params["batch_size"], shuffle=False)
-
-        print('Starting PyTorch model training for {} epochs...'.format(self.params["epochs"]))
-        self.model.train()
-        for epoch in range(self.params["epochs"]):
-            epoch_loss = 0.0
-            for batch_X, batch_y in train_loader:
-                self.optimizer.zero_grad()
-                outputs = self.model(batch_X)
-                loss = self.criterion(outputs, batch_y)
-                loss.backward()
-                self.optimizer.step()
-                epoch_loss += loss.item() * batch_X.size(0)
-            
-            avg_epoch_loss = epoch_loss / len(train_loader.dataset)
-            log_msg = 'Epoch [{}/{}], Train Loss: {:.4f}'.format(epoch+1, self.params["epochs"], avg_epoch_loss)
-
-            if val_loader:
-                self.model.eval()
-                val_loss = 0.0
-                with torch.no_grad():
-                    for batch_X_val, batch_y_val in val_loader:
-                        outputs_val = self.model(batch_X_val)
-                        loss_val = self.criterion(outputs_val, batch_y_val)
-                        val_loss += loss_val.item() * batch_X_val.size(0)
-                avg_val_loss = val_loss / len(val_loader.dataset)
-                log_msg += f", Val Loss: {avg_val_loss:.4f}"
-                self.model.train() # Set back to train mode
-            
-            if (epoch + 1) % max(1, self.params["epochs"] // 10) == 0 or epoch == self.params["epochs"] - 1:
-                 print(log_msg)
-        
-        self.is_trained = True
-        print("PyTorch model training completed.")
-
-    def predict(self, X: pd.DataFrame, **kwargs) -> Any:
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        self.model.eval()
-        X_tensor = torch.tensor(X.values, dtype=torch.float32).to(self.device)
-        with torch.no_grad():
-            outputs = self.model(X_tensor)
-            if self.task_type == "regression":
-                return outputs.cpu().numpy().flatten()
-            elif self.task_type == "classification":
-                if self.params["output_features"] == 1: # Binary with sigmoid output from BCEWithLogitsLoss
-                    preds = (torch.sigmoid(outputs) > 0.5).cpu().numpy().astype(int).flatten()
-                else: # Multiclass with softmax output from CrossEntropyLoss
-                    preds = torch.argmax(outputs, dim=1).cpu().numpy().flatten()
-                return preds
-        return None # Should not reach here
-
-    def predict_proba(self, X: pd.DataFrame, **kwargs) -> Optional[Any]:
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Model is not trained yet. Call fit() first.")
-        if self.task_type != "classification":
-            print("predict_proba is only available for classification tasks.")
-            return None
-        
-        self.model.eval()
-        X_tensor = torch.tensor(X.values, dtype=torch.float32).to(self.device)
-        with torch.no_grad():
-            outputs = self.model(X_tensor)
-            if self.params["output_features"] == 1: # Binary
-                probas = torch.sigmoid(outputs).cpu().numpy()
-                return np.hstack((1 - probas, probas)) # Return as (N, 2) array
-            else: # Multiclass
-                probas = torch.softmax(outputs, dim=1).cpu().numpy()
-                return probas
-        return None
-
-    # save_model and load_model from BaseModel can be used if they just save/load self.model state_dict
-    # Or override for more specific PyTorch saving (e.g., saving optimizer state, epoch, etc.)
-    def save_model(self, path: str) -> None:
-        if not self.is_trained or self.model is None:
-            raise RuntimeError("Cannot save model: not trained yet.")
-        try:
-            # Save the model's state_dict, architecture info might be needed for loading
-            # For simplicity, just saving state_dict. Full pipeline save should handle more.
-            torch.save(self.model.state_dict(), path)
-            print(f"PyTorch model state_dict saved to {path}")
-        except Exception as e:
-            print(f"Error saving PyTorch model to {path}: {e}")
-            raise
-
-    def load_model(self, path: str) -> None:
-        # This requires the model architecture to be already initialized correctly.
-        # The ZeffyPipeline load mechanism should handle re-creating the model first.
-        if self.model is None:
-            # Attempt to re-initialize if definition is available
-            if self.model_definition_class and self.params.get("input_features") and self.params.get("output_features"):
-                 model_kwargs = self.params.get("model_kwargs", {})
-                 self.model = self.model_definition_class(
-                    input_dim=self.params["input_features"],
-                    output_dim=self.params["output_features"],
-                    **model_kwargs
-                 ).to(self.device)
-            else:
-                raise RuntimeError("Cannot load model: model architecture not initialized. Call _initialize_model_definition or ensure config is set.")
-        try:
-            self.model.load_state_dict(torch.load(path, map_location=self.device))
-            self.is_trained = True
-            print(f"PyTorch model state_dict loaded from {path}")
-        except Exception as e:
-            print(f"Error loading PyTorch model from {path}: {e}")
-            raise
-
-# A very simple default MLP for when no architecture is provided
-class SimpleMLP(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, hidden_dims: Optional[List[int]] = None, activation=nn.ReLU):
-        super().__init__()
-        if hidden_dims is None:
-            hidden_dims = [max(32, input_dim // 2), max(16, input_dim // 4)] # Simple heuristic
-        
-        layers = []
-        current_dim = input_dim
-        for h_dim in hidden_dims:
-            layers.append(nn.Linear(current_dim, h_dim))
-            layers.append(activation())
-            layers.append(nn.Dropout(0.3))
-            current_dim = h_dim
-        layers.append(nn.Linear(current_dim, output_dim))
-        self.network = nn.Sequential(*layers)
-
-    def forward(self, x):
-        return self.network(x)
-
-# if __name__ == "__main__": # Zeffy: Main block from module, commented out.
-    from sklearn.datasets import make_classification, make_regression
-    from sklearn.model_selection import train_test_split
-    import os
-
-    # Create a dummy model definition file for testing file loading
-    dummy_model_file_content = """
-import torch.nn as nn
-class CustomNet(nn.Module):
-    def __init__(self, input_dim, output_dim):
-        super().__init__()
-        self.fc1 = nn.Linear(input_dim, 64)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(64, output_dim)
-    def forward(self, x):
-        x = self.relu(self.fc1(x))
-        return self.fc2(x)
-"""
-    dummy_model_path = "/home/dummy_pytorch_model.py"
-    with open(dummy_model_path, "w") as f:
-        f.write(dummy_model_file_content)
-    print(f"Created dummy PyTorch model definition at {dummy_model_path}")
-
-    # --- Test Classification --- 
-    print("\n--- Testing PyTorchTabularNN for Classification ---")
-    X_clf_np, y_clf_np = make_classification(n_samples=200, n_features=10, n_informative=5, n_classes=2, random_state=42)
-    X_clf_df = pd.DataFrame(X_clf_np, columns=[f'feature_{i}' for i in range(X_clf_np.shape[1])])
-    y_clf_s = pd.Series(y_clf_np)
-    X_c_train, X_c_test, y_c_train, y_c_test = train_test_split(X_clf_df, y_clf_s, test_size=0.25, random_state=42)
-
-    nn_clf_params = {
-        "architecture_definition": dummy_model_path, # Test loading from file
-        "architecture_class_name": "CustomNet",
-        "epochs": 5,
-        "batch_size": 16,
-        "learning_rate": 0.01,
-        "input_features": X_c_train.shape[1], # Explicitly set for testing
-        # output_features will be inferred for classification
-    }
-    nn_clf_model = PyTorchTabularNN(model_type="pytorch_tabular_nn", task_type="classification", params=nn_clf_params)
-    nn_clf_model.fit(X_c_train, y_c_train, X_val=X_c_test, y_val=y_c_test)
-    clf_preds = nn_clf_model.predict(X_c_test)
-    clf_probas = nn_clf_model.predict_proba(X_c_test)
-    print(f"Classification Predictions (first 5): {clf_preds[:5]}")
-    print(f"Classification Probabilities (first 5):\n{clf_probas[:5]}")
-
-    # --- Test Regression --- 
-    print("\n--- Testing PyTorchTabularNN for Regression ---")
-    X_reg_np, y_reg_np = make_regression(n_samples=200, n_features=10, n_informative=5, random_state=42)
-    X_reg_df = pd.DataFrame(X_reg_np, columns=[f'feature_reg_{i}' for i in range(X_reg_np.shape[1])])
-    y_reg_s = pd.Series(y_reg_np)
-    X_r_train, X_r_test, y_r_train, y_r_test = train_test_split(X_reg_df, y_reg_s, test_size=0.25, random_state=42)
-
-    # Test with default SimpleMLP (no architecture_definition)
-    nn_reg_params = {
-        "epochs": 7,
-        "batch_size": 16,
-        "learning_rate": 0.005,
-        "input_features": X_r_train.shape[1],
-        "output_features": 1
-    }
-    nn_reg_model = PyTorchTabularNN(model_type="pytorch_tabular_nn", task_type="regression", params=nn_reg_params)
-    nn_reg_model.fit(X_r_train, y_r_train, X_val=X_r_test, y_val=y_r_test)
-    reg_preds = nn_reg_model.predict(X_r_test)
-    print(f"Regression Predictions (first 5): {reg_preds[:5]}")
-
-    # Clean up dummy model file
-    if os.path.exists(dummy_model_path):
-        os.remove(dummy_model_path)
-        print(f"Removed dummy PyTorch model definition at {dummy_model_path}")
-
-    print("\nPyTorchTabularNN tests finished.")
-
-
-
-
-# --- Zeffy Pipeline Core --- 
-
-
-import logging
-import random
-import joblib # For saving/loading pipeline
-
-class ZeffyPipeline:
-    def __init__(self, config_path: str = None, config_dict: dict = None):
-        self.config = load_config(config_path=config_path, config_dict=config_dict)
-        self.model_instance = None
-        self.logger = self._setup_logger()
-        self._apply_global_settings()
-        self.preprocessors = [] 
-        self.feature_engineering_steps = []
-
-    def _setup_logger(self):
-        log_level_str = self.config.global_settings.log_level.upper()
-        logging.basicConfig(level=getattr(logging, log_level_str, logging.INFO),
-                            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-                            force=True) 
-        logger = logging.getLogger("ZeffyPipeline")
-        logger.info(f"Logger initialized for ZeffyPipeline at level {log_level_str}.")
-        return logger
-
-    def _apply_global_settings(self):
-        if self.config.global_settings.random_seed is not None:
-            random.seed(self.config.global_settings.random_seed)
-            np.random.seed(self.config.global_settings.random_seed)
-            if 'torch' in sys.modules and PYTORCH_AVAILABLE:
-                 torch.manual_seed(self.config.global_settings.random_seed)
-                 if torch.cuda.is_available():
-                    torch.cuda.manual_seed_all(self.config.global_settings.random_seed)
-            self.logger.info(f"Global random seed set to: {self.config.global_settings.random_seed}")
-
-    def _load_data(self):
-        self.logger.info(f"Loading data using: {self.config.data_loader.type}")
-        if self.config.data_loader.type == "sklearn_dataset":
-            if self.config.data_loader.dataset_name == "iris":
-                from sklearn.datasets import load_iris
-                data = load_iris()
-                X = pd.DataFrame(data.data, columns=data.feature_names)
-                y = pd.Series(data.target, name=self.config.data_loader.target_column or "target")
-                return X, y
-            else:
-                raise ZeffyDataError(f"Sklearn dataset '{self.config.data_loader.dataset_name}' not implemented in example loader.")
-        elif self.config.data_loader.type == "csv":
-            if not self.config.data_loader.path:
-                raise ZeffyDataError("CSV path not specified in data_loader config.")
-            if not os.path.exists(self.config.data_loader.path):
-                raise ZeffyDataError(f"CSV file not found at: {self.config.data_loader.path}")
-            df = pd.read_csv(self.config.data_loader.path)
-            if not self.config.data_loader.target_column:
-                raise ZeffyDataError("Target column not specified for CSV data_loader.")
-            if self.config.data_loader.target_column not in df.columns:
-                raise ZeffyDataError(f"Target column '{self.config.data_loader.target_column}' not found in CSV.")
-            X = df.drop(columns=[self.config.data_loader.target_column])
-            y = df[self.config.data_loader.target_column]
-            return X,y
-        raise ZeffyDataError(f"Data loader type '{self.config.data_loader.type}' not implemented.")
-
-    def fit(self, X_train=None, y_train=None, X_val=None, y_val=None):
-        self.logger.info(f"Starting Zeffy pipeline fitting for project: {self.config.project_name}")
-        if X_train is None and y_train is None:
-            X_train, y_train = self._load_data()
-            self.logger.info(f"Data loaded internally: X_train shape {X_train.shape if X_train is not None else 'None'}, y_train shape {y_train.shape if y_train is not None else 'None'}")
-        elif X_train is None or y_train is None:
-            raise ZeffyDataError("Both X_train and y_train must be provided, or neither (to use internal data loader).")
-        X_train_featured = X_train 
-        X_val_featured = X_val 
-        if not self.config.models:
-            raise ZeffyConfigurationError("No models specified in the configuration.")
-        model_config = self.config.models[0]
-        self.logger.info(f"Preparing model: {model_config.type} with task: {model_config.task_type}")
-        model_params_dict = model_config.params.model_dump() if model_config.params else {}
-        if 'random_state' not in model_params_dict and 'random_seed' not in model_params_dict and self.config.global_settings.random_seed is not None:
-             if model_config.type in ["lightgbm_classifier", "lightgbm_regressor", "xgboost_classifier", "xgboost_regressor", "sklearn_logistic_regression"]:
-                 model_params_dict['random_state'] = self.config.global_settings.random_seed
-             elif model_config.type in ["catboost_classifier", "catboost_regressor"]:
-                 model_params_dict['random_seed'] = self.config.global_settings.random_seed
-        self.model_instance = get_model(model_type=model_config.type, 
-                                        task_type=model_config.task_type, 
-                                        params=model_params_dict)
-        self.logger.info(f"Fitting model {model_config.type}...")
-        self.model_instance.fit(X_train_featured, y_train, X_val=X_val_featured, y_val=y_val)
-        self.logger.info("Model training completed.")
-
-    def predict(self, X_test):
-        if not self.model_instance or not self.model_instance.is_trained:
-            raise ZeffyNotFittedError("Pipeline has not been fitted or model is not trained.")
-        X_test_featured = X_test
-        self.logger.info("Making predictions.")
-        return self.model_instance.predict(X_test_featured)
-
-    def predict_proba(self, X_test):
-        if not self.model_instance or not self.model_instance.is_trained:
-            raise ZeffyNotFittedError("Pipeline has not been fitted or model is not trained.")
-        model_config = self.config.models[0]
-        if model_config.task_type != "classification":
-            self.logger.warning("predict_proba is for classification models.")
-            return None
-        X_test_featured = X_test
-        self.logger.info("Making probability predictions.")
-        return self.model_instance.predict_proba(X_test_featured)
-
-    def evaluate(self, X_test, y_test, metrics=None):
-        from sklearn.metrics import accuracy_score, mean_squared_error, f1_score, roc_auc_score
-        self.logger.info("Evaluating model.")
-        model_config = self.config.models[0]
-        task_type = model_config.task_type
-        results = {}
-        if metrics is None:
-            metrics = self.config.evaluation.metrics if self.config.evaluation else []
-        if not metrics:
-            metrics = ["accuracy"] if task_type == "classification" else ["rmse"]
-            self.logger.warning(f"No metrics specified for evaluation, using default: {metrics}")
-        predictions = self.predict(X_test)
-        for metric_name in metrics:
-            try:
-                if task_type == "classification":
-                    if metric_name == "accuracy":
-                        results[metric_name] = accuracy_score(y_test, predictions)
-                    elif metric_name == "f1_macro":
-                        results[metric_name] = f1_score(y_test, predictions, average="macro")
-                    elif metric_name == "roc_auc_ovr" or metric_name == "roc_auc":
-                        probas = self.predict_proba(X_test)
-                        if probas is not None:
-                            if probas.shape[1] == 2:
-                                results[metric_name] = roc_auc_score(y_test, probas[:, 1])
+                    elif agg=='(x-mean)/std':
+                        if f'{feature_col}_mean' in df.columns and f'{feature_col}_std' in df.columns:
+                           df[f'{feature_col}-{feature_col}_mean_divide_std']=(df[f'{feature_col}']-df[f'{feature_col}_mean'])/(df[f'{feature_col}_std']+self.eps)
+                        else:
+                           raise ValueError(f"mean and std must in {feature_col}'s AGGREGATIONS.")
+                    else:
+                        if '+' in agg:
+                            #example:['mean','std']
+                            split_agg=agg.split('+')
+                            if f'{feature_col}_{split_agg[0]}' in df.columns and f'{feature_col}_{split_agg[1]}' in df.columns:
+                                df[f'{feature_col}_{split_agg[0]}+{feature_col}_{split_agg[1]}']=\
+                                df[f'{feature_col}_{split_agg[0]}']+df[f'{feature_col}_{split_agg[1]}']
                             else:
-                                results[metric_name] = roc_auc_score(y_test, probas, multi_class="ovr", average="macro")
-                elif task_type == "regression":
-                    if metric_name == "rmse":
-                        results[metric_name] = mean_squared_error(y_test, predictions, squared=False)
-                    elif metric_name == "mae":
-                        from sklearn.metrics import mean_absolute_error
-                        results[metric_name] = mean_absolute_error(y_test, predictions)
-                    elif metric_name == "r2":
-                        from sklearn.metrics import r2_score
-                        results[metric_name] = r2_score(y_test, predictions)
-                self.logger.info(f"Calculated metric {metric_name}: {results.get(metric_name)}")
-            except Exception as e:
-                self.logger.error(f"Could not calculate metric {metric_name}: {e}")
-                results[metric_name] = None
-        self.logger.info(f"Evaluation results: {results}")
-        return results
+                                raise ValueError(f"{split_agg[0]} and {split_agg[1]} must in {feature_col}'s AGGREGATIONS.")
+                        
+                        elif '-' in agg:
+                            #example:['mean','std']
+                            split_agg=agg.split('-')
+                            if f'{feature_col}_{split_agg[0]}' in df.columns and f'{feature_col}_{split_agg[1]}' in df.columns:
+                                df[f'{feature_col}_{split_agg[0]}-{feature_col}_{split_agg[1]}']=\
+                                df[f'{feature_col}_{split_agg[0]}']-df[f'{feature_col}_{split_agg[1]}']
+                            else:
+                                raise ValueError(f"{split_agg[0]} and {split_agg[1]} must in {feature_col}'s AGGREGATIONS.")   
 
-    def save_pipeline(self, path_prefix: str):
-        if not os.path.exists(path_prefix):
-            os.makedirs(path_prefix, exist_ok=True)
-        pipeline_file = os.path.join(path_prefix, "zeffy_pipeline.joblib")
-        config_file = os.path.join(path_prefix, "zeffy_config.yaml")
-        try:
-            temp_logger = self.logger
-            self.logger = None 
-            joblib.dump(self, pipeline_file)
-            self.logger = temp_logger
-            with open(config_file, 'w') as f:
-                yaml.dump(self.config.model_dump(mode='json'), f)
-            self.logger.info(f"Pipeline saved to {path_prefix}")
-        except Exception as e:
-            if hasattr(self, 'logger') and self.logger is not None:
-                 self.logger.error(f"Error saving pipeline: {e}")
-            else:
-                 print(f"Error saving pipeline (logger not available): {e}")
-            raise ZeffyError(f"Failed to save pipeline to {path_prefix}: {e}")
+                        elif '*' in agg:
+                            #example:['mean','std']
+                            split_agg=agg.split('*')
+                            if f'{feature_col}_{split_agg[0]}' in df.columns and f'{feature_col}_{split_agg[1]}' in df.columns:
+                                df[f'{feature_col}_{split_agg[0]}*{feature_col}_{split_agg[1]}']=\
+                                df[f'{feature_col}_{split_agg[0]}']*df[f'{feature_col}_{split_agg[1]}']
+                            else:
+                                raise ValueError(f"{split_agg[0]} and {split_agg[1]} must in {feature_col}'s AGGREGATIONS.")  
 
-    @staticmethod
-    def load_pipeline(path_prefix: str):
-        pipeline_file = os.path.join(path_prefix, "zeffy_pipeline.joblib")
-        if not os.path.exists(pipeline_file):
-            raise ZeffyError(f"Pipeline file not found at {pipeline_file}")
-        try:
-            pipeline = joblib.load(pipeline_file)
-            pipeline.logger = pipeline._setup_logger()
-            pipeline.logger.info(f"Pipeline loaded from {path_prefix}")
-            return pipeline
-        except Exception as e:
-            print(f"Error loading pipeline: {e}")
-            raise ZeffyError(f"Failed to load pipeline from {path_prefix}: {e}")
+                        elif '/' in agg:
+                            #example:['mean','std']
+                            split_agg=agg.split('/')
+                            if f'{feature_col}_{split_agg[0]}' in df.columns and f'{feature_col}_{split_agg[1]}' in df.columns:
+                                df[f'{feature_col}_{split_agg[0]}_divide_{feature_col}_{split_agg[1]}']=\
+                                df[f'{feature_col}_{split_agg[0]}']/(df[f'{feature_col}_{split_agg[1]}']+self.eps)
+                            else:
+                                raise ValueError(f"{split_agg[0]} and {split_agg[1]} must in {feature_col}'s AGGREGATIONS.")  
 
+                        else:
+                            raise ValueError(f"Zeffy can't support {agg}")  
 
-# --- Example Usage for Consolidated zeffy.py ---
-if __name__ == "__main__":
-    print("Running Zeffy consolidated example...")
-    dummy_config_dict = {
-        "project_name": "Zeffy Single File Test",
-        "global_settings": {"random_seed": 42, "log_level": "INFO"},
-        "data_loader": {
-            "type": "sklearn_dataset",
-            "dataset_name": "iris",
-            "target_column": "target" 
-        },
-        "models": [
-            {
-                "type": "lightgbm_classifier", 
-                "task_type": "classification",
-                "params": {"n_estimators": 20, "learning_rate": 0.1}
-            }
-        ],
-        "evaluation": {
-            "metrics": ["accuracy", "f1_macro"]
-        }
-    }
-    from sklearn.datasets import load_iris
-    from sklearn.model_selection import train_test_split
-    iris_data = load_iris()
-    X_main = pd.DataFrame(iris_data.data, columns=iris_data.feature_names)
-    y_main = pd.Series(iris_data.target, name="target")
-    X_train_main, X_test_main, y_train_main, y_test_main = train_test_split(X_main, y_main, test_size=0.3, random_state=42, stratify=y_main)
-    dummy_config_path = "/home/ubuntu/dummy_zeffy_config.yaml"
-    try:
-        with open(dummy_config_path, 'w') as f:
-            yaml.dump(dummy_config_dict, f)
+           
+        if (mode=='train') and (self.use_high_corr_feat==False):#drop high correlation features
+            print("< drop high correlation feature >")
+            self.high_corr_cols=self.drop_high_correlation_feats(df)
+       
+        if len(self.cross_cols)!=0:
+            print("< cross feature >")
+            for i in range(len(self.cross_cols)):
+                for j in range(i+1,len(self.cross_cols)):
+                    df[self.cross_cols[i]+"+"+self.cross_cols[j]]=df[self.cross_cols[i]]+df[self.cross_cols[j]]
+                    df[self.cross_cols[i]+"-"+self.cross_cols[j]]=df[self.cross_cols[i]]-df[self.cross_cols[j]]
+                    df[self.cross_cols[i]+"*"+self.cross_cols[j]]=df[self.cross_cols[i]]*df[self.cross_cols[j]]
+                    df[self.cross_cols[i]+"_divide_"+self.cross_cols[j]]=df[self.cross_cols[i]]/(df[self.cross_cols[j]]+self.eps)
         
-        pipeline_from_file = ZeffyPipeline(config_path=dummy_config_path)
-        pipeline_from_file.fit(X_train=X_train_main, y_train=y_train_main)
+        print("< drop useless cols >")
+        total_drop_cols=self.nan_cols+self.unique_cols+drop_cols+self.high_corr_cols
+        print(f"nan_cols:{self.nan_cols}")
+        print(f"unique_cols:{self.unique_cols}")
+        print(f"drop_cols:{drop_cols}")
+        print(f"high_corr_cols:{self.high_corr_cols}")
+        total_drop_cols=[col for col in total_drop_cols if col not in \
+                         self.word2vec_cols+self.labelencoder_cols+self.category_cols]
+        df.drop(total_drop_cols,axis=1,inplace=True,errors='ignore')
 
-        print("--- Making predictions ---")
-        predictions = pipeline_from_file.predict(X_test_main)
-        print(f"Predictions (first 10): {predictions[:10]}")
-
-        if dummy_config_dict['models'][0]['task_type'] == "classification":
-            probabilities = pipeline_from_file.predict_proba(X_test_main)
-            if probabilities is not None:
-                print(f"Probabilities (first 5):\n{probabilities[:5]}")
-
-        print("--- Evaluating pipeline ---")
-        eval_results = pipeline_from_file.evaluate(X_test_main, y_test_main)
-        print(f"Evaluation results: {eval_results}")
-
-        print("--- Saving pipeline ---")
-        save_path = "/home/ubuntu/zeffy_saved_pipeline"
-        pipeline_from_file.save_pipeline(save_path)
-        print(f"Pipeline saved to {save_path}")
-
-        print("--- Loading pipeline ---")
-        loaded_pipeline = ZeffyPipeline.load_pipeline(save_path)
-        print(f"Pipeline loaded. Project: {loaded_pipeline.config.project_name}")
-        loaded_predictions = loaded_pipeline.predict(X_test_main)
+        if self.use_scaler:
+            if mode=='train':
+                #'/' will be considered as a path.
+                self.num_cols=[col for col in df.drop([self.target_col],axis=1).columns \
+                               if ( str(df[col].dtype) not in ['object','category'] ) and ('/' not in col)]
+            print("< robust scaler >")
+            for col in self.num_cols:
+                try:
+                    scaler=self.trained_scaler[f'robustscaler_{col}.model']
+                except:
+                    scaler = RobustScaler(
+                            with_centering=True,with_scaling=True,
+                            quantile_range=(5.0,95.0),
+                        )
+                    scaler.fit(df[col].values.reshape(-1,1))
+                    self.pickle_dump(scaler,self.model_save_path+f'robustscaler_{col}_{self.target_col}.model')
+                    self.trained_scaler[f'robustscaler_{col}.model']=copy.deepcopy(scaler)
+                df[col] = scaler.transform(df[col].values.reshape(-1,1))
+                df[col]=df[col].clip(-5,5)
+        if self.use_reduce_memory:
+            df=self.reduce_mem_usage(df,float16_as32=True)
         
-        if np.array_equal(predictions, loaded_predictions):
-            print("Loaded pipeline predictions match original. Test successful!")
+        print("-"*30)
+        return df
+
+    def label_encoder(self,df:pd.DataFrame,label_encoder_cols,fold:int=0,repeat:int=0):
+        for col in label_encoder_cols:
+            self.PrintColor(f"-> for column {col} labelencoder feature",color=Fore.RED)
+            #load model when model is existed,fit when model isn't exist.
+            try:
+                le=self.trained_le[f'le_{col}_repeat{repeat}_fold{fold}.model']
+            except:#training
+                value=df[col].value_counts().to_dict()
+                le={}
+                for k,v in value.items():
+                    le[k]=len(le)
+                self.pickle_dump(le,self.model_save_path+f'le_{col}_repeat{repeat}_fold{fold}_{self.target_col}.model')
+                self.trained_le[f'le_{col}_repeat{repeat}_fold{fold}.model']=copy.deepcopy(le)
+            df[col] = df[col].apply(lambda x:le.get(x,0)) 
+        return df
+
+    #reference: https://www.kaggle.com/code/cdeotte/first-place-single-model-cv-1-016-lb-1-016   In[6]
+    def CV_stat(self,X,y=None,repeat:int=0,fold:int=0):
+        if len(self.target_stat):
+            if type(y)==type(None):#valid set or test set(transform)
+                TE=self.trained_TE[f'TE_repeat{repeat}_fold{fold}.model']
+            else:#train set(fit and transform)
+                y=pd.DataFrame({self.target_col:y.values})
+                df=pd.concat((X,y),axis=1)
+                #repeat i fold j's TE  cat_col2value 
+                TE={}
+                for (g_col,t_col,agg) in self.target_stat:
+                    g_col=self.colname_clean([g_col])[0]
+                    if t_col!=self.target_col:
+                        t_col=self.colname_clean([t_col])[0]
+                        
+                    #deal with value_counts()<10 
+                    df_copy=df[[g_col,t_col]].copy()
+                    gcol2counts=df_copy[g_col].value_counts().to_dict()
+                    GCOLS=[gcol for gcol,count in gcol2counts.items() if count>min(10,len(df)//100) ]
+                    df_copy=df_copy[df_copy[g_col].isin(GCOLS)]
+                    
+                    agg_df = df_copy.groupby(g_col).agg(agg).reset_index()
+                    agg_df.columns = ['_'.join(x) for x in agg_df.columns]
+                    agg_df.columns = [ f'{g_col}_transform_{x}' for x in agg_df.columns if x!=g_col]
+                    agg_df=agg_df.rename(columns={f"{g_col}_transform_{g_col}_":g_col})
+                    TE[f"{g_col}_TE_{t_col}"]=agg_df
+                #save TE
+                self.pickle_dump(TE,self.model_save_path+f'TE_repeat{repeat}_fold{fold}_{self.target_col}.model')
+                self.trained_TE[f'TE_repeat{repeat}_fold{fold}.model']=copy.deepcopy(TE)
+            #transform
+            for k,agg_df in TE.items():
+                g_col,t_col=k.split("_TE_")
+                X=X.merge(agg_df,on=g_col,how='left')
+                #fillna
+                y=pd.DataFrame({self.target_col:self.target})
+                y=pd.concat((self.features,y),axis=1)
+                agg_df_columns=agg_df.drop([g_col],axis=1).columns
+                aggs=[a for c in list(agg_df_columns) for a in ['nunique','count','min','max','first','last',
+                               'mean','median','sum','std','skew'] if a in c]
+                agg_df_agg=y[t_col].agg(aggs).values
+                for i in range(len(agg_df_columns)):
+                    X[agg_df_columns[i]]=X[agg_df_columns[i]].fillna(agg_df_agg[i])
+        return X 
+    
+    #Feature engineering that needs to be done internally in cross validation.
+    def CV_FE(self,df:pd.DataFrame,mode:str='train',fold:int=0,repeat:int=0)->pd.DataFrame:
+        #labelencoder
+        if len(self.labelencoder_cols):
+            print("< label encoder >")
+            df=self.label_encoder(df,label_encoder_cols=self.colname_clean(self.labelencoder_cols),fold=fold,repeat=repeat)
+
+        if len(self.word2vec_models):
+            print("< word2vec >")
+            for (word2vec,col,model_name,use_svd) in self.word2vec_models:
+                col=self.colname_clean([col])[0]
+                self.PrintColor(f"-> for column {col} {model_name} word2vec feature",color=Fore.RED)
+                #tfidf,countvec
+                if 'word2vec' not in model_name:
+                    #load when model is existed.fit when model isn't existed.
+                    try:
+                        word2vec=self.trained_wordvec[f'{model_name}_{col}_repeat{repeat}_fold{fold}.model' ]
+                    except:
+                        word2vec.fit(df[col])
+                        self.pickle_dump(word2vec,self.model_save_path+f'{model_name}_{col}_repeat{repeat}_fold{fold}_{self.target_col}.model') 
+                        self.trained_wordvec[f'{model_name}_{col}_repeat{repeat}_fold{fold}.model' ]=copy.deepcopy(word2vec)
+                    word2vec_feats=word2vec.transform(df[col]).toarray()
+                else:#word2vec from gensim  Word2Vec(vector_size=256, window=5, min_count=2, workers=16)
+                    texts=list(df[col].values)
+                    texts_split=[text.split() for text in texts]
+                    try:
+                        word2vec_copy=self.trained_wordvec[f'{model_name}_{col}_repeat{repeat}_fold{fold}.model' ]
+                    except:
+                        word2vec_copy=copy.deepcopy(word2vec)
+                        word2vec_copy.build_vocab(texts_split)
+                        word2vec_copy.train(texts_split, total_examples=word2vec_copy.corpus_count,
+                                       epochs=word2vec_copy.epochs)
+                        self.pickle_dump(word2vec_copy,self.model_save_path+f'{model_name}_{col}_repeat{repeat}_fold{fold}_{self.target_col}.model') 
+                        self.trained_wordvec[f'{model_name}_{col}_repeat{repeat}_fold{fold}.model' ]=copy.deepcopy(word2vec_copy)
+                    #transform 
+                    word2vec_feats = []
+                    for text in texts:
+                        vector = np.zeros(word2vec_copy.vector_size)
+                        count = 0
+                        for word in text:
+                            if word in word2vec_copy.wv:#if word in word vocabulary
+                                vector += word2vec_copy.wv[word]
+                                count += 1
+                        if count > 0:
+                            vector /= count
+                        word2vec_feats.append(vector)
+                    word2vec_feats=np.array(word2vec_feats)
+
+                if use_svd:
+                    try:
+                        svd=self.trained_svd[f'{model_name}_svd_{col}_repeat{repeat}_fold{fold}.model']
+                    except:
+                        svd = TruncatedSVD(n_components=word2vec_feats.shape[1]//3+1,
+                                            n_iter=10, random_state=self.seed)
+                        svd.fit(word2vec_feats)
+                        self.trained_svd[f'{model_name}_svd_{col}_repeat{repeat}_fold{fold}.model']=copy.deepcopy(svd)
+                        self.pickle_dump(word2vec,self.model_save_path+f'{model_name}_svd_{col}_repeat{repeat}_fold{fold}_{self.target_col}.model') 
+                    word2vec_feats=svd.transform(word2vec_feats)
+                for i in range(word2vec_feats.shape[1]):
+                    df[f"{col}_{model_name}_{i}"]=word2vec_feats[:,i]
+        #drop object_cols here because CV_stat may use category_string_cols.
+        df.drop(self.colname_clean(self.word2vec_cols+self.labelencoder_cols+self.object_cols),axis=1,inplace=True,errors='ignore')
+        #after this operation,df will be dropped into model,so we need to Convert object to floating-point numbers
+        for col in df.columns:
+            if (df[col].dtype==object):
+                df[col]=df[col].astype(np.float32)
+        #replace inf to nan
+        df.replace([np.inf, -np.inf], np.nan, inplace=True)
+        #xgboost treat -1 as missing value.
+        num_cols=[col for col in df.columns if str(df[col].dtype) not in ['category','object','string']]
+        #when you use tabnet or LinearRegression.
+        df[num_cols]=df[num_cols].fillna(0)
+        return df
+
+    def roc_auc_score(self,y_true:np.array,y_pro:np.array):
+        pos_idx=np.where(y_true==1)[0]
+        neg_idx=np.where(y_true==0)[0]
+        pos_pro=sorted(y_pro[pos_idx])
+        neg_pro=sorted(y_pro[neg_idx])
+        total_sample_cnt,greater_sample_cnt=len(pos_pro)*len(neg_pro),0
+        left,right=0,0
+        while left<len(pos_pro):
+            while right<len(neg_pro) and (pos_pro[left]>neg_pro[right]):
+                right+=1
+            if right<len(neg_pro):
+                greater_sample_cnt+=right
+                left+=1
+            else:#right>=len(neg_pro)
+                greater_sample_cnt+=len(neg_pro)*(len(pos_pro)-left)
+                left=len(pos_pro)
+        auc_score=greater_sample_cnt/total_sample_cnt
+        return auc_score
+
+    def Medae(self,y_true:np.array,y_pred:np.array):
+        return np.median(np.abs(y_true-y_pred))
+    
+    def Metric(self,y_true:np.array,y_pred:np.array,weight=np.zeros(0))->float:#for multi_class,labeland proability
+        #due to the use of the reduce_mem function to reduce memory, it may result in over range after data addition.
+        if self.objective=='regression':
+            y_true,y_pred=y_true.astype(np.float64),y_pred.astype(np.float64)
         else:
-            print("Loaded pipeline predictions DO NOT match. Test FAILED.")
-    except Exception as e:
-        print(f"Error in Zeffy example: {e}")
-        import traceback
-        traceback.print_exc()
-    finally:
-        if os.path.exists(dummy_config_path):
-            os.remove(dummy_config_path)
-        if os.path.exists(save_path):
-            import shutil
-            shutil.rmtree(save_path) # remove directory and its contents
+            y_true,y_pred=y_true.astype(np.int64),y_pred.astype(np.float64)
+        #use cutom_metric when you define.
+        if self.custom_metric!=None:
+            if len(weight)!=0:
+                return self.custom_metric(y_true,y_pred,weight)
+            else:
+                try:
+                    return self.custom_metric(y_true,y_pred)
+                except:
+                    weight=np.ones(len(y_true))
+                    return self.custom_metric(y_true,y_pred,weight)
+        if self.objective=='regression':
+            if self.metric=='medae':
+                return self.Medae(y_true,y_pred)
+            elif self.metric=='mae':
+                return np.mean(np.abs(y_true-y_pred))
+            elif self.metric=='rmse':
+                return np.sqrt(np.mean((y_true-y_pred)**2))
+            elif self.metric=='mse':
+                return np.mean((y_true-y_pred)**2)
+            elif self.metric=='rmsle':
+                y_pred=np.clip(y_pred,0,1e20)
+                return np.sqrt(np.mean((np.log1p(y_true)-np.log1p(y_pred))**2))
+            elif self.metric=='msle':
+                y_pred=np.clip(y_pred,0,1e20)
+                return np.mean((np.log1p(y_true)-np.log1p(y_pred))**2)
+            elif self.metric=='mape':
+                return np.mean(np.abs(y_pred-y_true)/(y_true+self.eps))
+            elif self.metric=='r2':
+                return 1-np.sum ((y_true-y_pred)**2)/np.sum ((y_true-np.mean(y_true))**2)
+            elif self.metric=='smape':
+                return 200*np.mean(np.abs(y_true-y_pred) / (  np.abs(y_true)+np.abs(y_pred)+self.eps  ) )
+        else:
+            if self.metric=='accuracy':
+                #lgb_eval_metric or Metric(target,oof_preds)?
+                if y_pred.shape==(len(y_pred),self.num_classes):
+                    y_pred=np.argmax(y_pred,axis=1)#transform probability to label
+                else:#shape==len(y_pred), maybe:[0.1,0.9],maybe:[0,1]
+                    y_pred=np.round(y_pred)
+                return np.mean(y_true==y_pred)
+            elif self.metric=='auc':
+                #lgb_eval_metric or Metric(target,oof_preds)?
+                if y_pred.shape==(len(y_pred),self.num_classes):
+                    y_pred=y_pred[:,1]
+                return roc_auc_score(y_true,y_pred)
+            #https://www.kaggle.com/competitions/phems-hackathon-early-sepsis-prediction
+            elif self.metric=='pr_auc':
+                if y_pred.shape==(len(y_pred),self.num_classes):
+                    y_pred=y_pred[:,1]
+                precision, recall, thresholds = precision_recall_curve(y_true, y_pred)
+                pr_auc = auc(recall, precision)
+                return pr_auc
+            elif self.metric=='f1_score':
+                #lgb_eval_metric or Metric(target,oof_preds)?
+                if y_pred.shape==(len(y_pred),self.num_classes):
+                    y_pred=np.argmax(y_pred,axis=1)#transform probability to label
+                else:#shape==len(y_pred), maybe:[0.1,0.9],maybe:[0,1]
+                    y_pred=np.round(y_pred)
+                return f1_score(y_true, y_pred)
+            elif self.metric=='mcc':
+                #lgb_eval_metric or Metric(target,oof_preds)?
+                if y_pred.shape==(len(y_pred),self.num_classes):
+                    y_pred=np.argmax(y_pred,axis=1)#transform probability to label
+                else:#shape==len(y_pred), maybe:[0.1,0.9],maybe:[0,1]
+                    y_pred=np.round(y_pred)
+                return matthews_corrcoef(y_true, y_pred)
+            elif self.metric in ['logloss','multi_logloss']:
+                y_true=np.eye(self.num_classes)[y_true]
+                y_pred=np.clip(y_pred,self.eps,1-self.eps)
+                return -np.mean(np.sum(y_true*np.log(y_pred),axis=-1))
+    
+    def optuna_lgb(self,X:pd.DataFrame,y:pd.DataFrame,group,kf_folds:pd.DataFrame,metric:str)->dict:
+        def objective(trial):
+            params = {
+                "boosting_type": "gbdt","metric": metric,
+                'random_state': self.seed,
+                'n_estimators': trial.suggest_int('n_estimators', 500,1500),
+                'reg_alpha': trial.suggest_loguniform('reg_alpha', 1e-3, 10.0),
+                'reg_lambda': trial.suggest_loguniform('reg_lambda', 1e-3, 10.0),
+                'colsample_bytree': trial.suggest_float('colsample_bytree', 0.5, 1),
+                'subsample': trial.suggest_float('subsample', 0.5, 1),
+                'learning_rate': trial.suggest_float('learning_rate', 1e-4, 0.5, log=True),
+                'num_leaves' : trial.suggest_int('num_leaves', 8, 64),
+                'min_child_samples': trial.suggest_int('min_child_samples', 2, 100),
+                "extra_trees":True,
+                "verbose": -1
+            }
+            if self.device in ['cuda','gpu']:#gpu mode when training
+                params['device']='gpu'
+                params['gpu_use_dp']=True
+            model_name='lgb'
+            if self.objective=='regression':
+                model=LGBMRegressor(**params)
+            else:
+                model=LGBMClassifier(**params)   
+            oof_preds,metric_score=self.cross_validation(X=X,y=y,group=group,kf_folds=kf_folds,
+                                                         model=model,model_name=model_name,
+                                                         sample_weight=self.sample_weight,use_optuna=True,                       
+                                                         repeat=0,num_folds=self.num_folds,CV_FE=self.CV_FE,
+                                                         num_classes=self.num_classes,objective=self.objective,
+                                                         log=self.log,use_pseudo_label=self.use_pseudo_label,
+                                                         test=self.test,group_col=self.group_col,target_col=self.target_col,
+                                                         category_cols=self.category_cols,
+                                                         CV_stat=self.CV_stat,
+                                                         use_data_augmentation=self.use_data_augmentation,
+                                                         CV_sample=self.CV_sample,device=self.device,
+                                                         early_stop=self.early_stop,use_eval_metric=self.use_eval_metric,
+                                                         lgb_eval_metric=self.lgb_eval_metric,xgb_eval_metric=self.xgb_eval_metric,
+                                                         plot_feature_importance=self.plot_feature_importance,
+                                                         exp_mode=self.exp_mode,exp_mode_b=self.exp_mode_b,
+                                                         use_CIR=self.use_CIR,metric=self.metric,Metric=self.Metric
+                                                        )
+            return metric_score
+        
+        #direction is 'minimize' or 'maximize'
+        direction=self.optuna_direction
+        for key in self.direction2metric.keys():
+            if self.metric in self.direction2metric[key]:
+                direction=key
+            
+        study = optuna.create_study(direction=direction, study_name='find best lgb_params') 
+        study.optimize(objective, n_trials=self.use_optuna_find_params)
+        best_params=study.best_trial.params
+        best_params["boosting_type"]="gbdt"
+        best_params["extra_trees"]=True
+        best_params["metric"]=metric
+        best_params['random_state']=self.seed
+        best_params['verbose']=-1
+        print(f"best_params={best_params}")
+        return best_params
 
-    print("Zeffy consolidated example finished.")
+    def colname_clean(self,cols):
+        #deal with json character
+        json_char=',[]{}:"\\'
+        for i in range(len(cols)):
+            if cols[i]!=self.target_col:
+                for char in json_char:
+                    cols[i]=cols[i].replace(char,'json')
+                cols[i]=cols[i].replace(' ','_')
+        return cols
+
+    def load_data(self,path_or_file:str|pd.DataFrame|pl.DataFrame='train.csv',mode:str='')->None|pd.DataFrame:
+        if mode=='train':
+            #read csv,parquet or csv_file
+            self.train_path_or_file=path_or_file
+        if type(path_or_file)==str:#path
+            if path_or_file[-4:]=='.csv':
+                file=pl.read_csv(path_or_file)
+            elif path_or_file[-8:]=='.parquet':
+                file=pl.read_parquet(path_or_file)
+            try:#if load csv or parquet file
+                file=file.to_pandas()
+            except:
+                raise ValueError("Zeffy can only support csv file or parquet file")
+        else:#file
+            file=path_or_file.copy()
+            #polars to pandas.
+            if isinstance(file, pl.DataFrame):
+                file=file.to_pandas()
+            if not isinstance(file, pd.DataFrame):
+                raise ValueError(f"{mode}_path_or_file is not pd.DataFrame.")
+        
+        if mode=='train':
+            train=file.copy()
+            #if target_col is nan,then drop these data.
+            train=train[~train[self.target_col].isna()]
+            if self.weight_col not in list(train.columns):
+               train[self.weight_col]=1
+            if len(train)<=self.one_hot_max:
+                raise ValueError(f"one_hot_max must less than {len(train)}")
+            for col in train.columns:
+                self.col2dtype[col]=train[col].dtype
+            if self.objective=='regression':
+                train[self.target_col]=train[self.target_col].astype(np.float32)
+            return train
+        elif mode=='test':
+            test=file.copy()
+            for col in test.columns:
+                test[col]=test[col].astype(self.col2dtype.get(col,object))
+            return test
+        else:#submission.csv
+            return file
+
+    
+    def construct_seasonal_feature(self,df:pd.DataFrame,date_col:str='date',timestep:str='day'):
+        #df[date_col] second
+        if timestep=='second':
+            df[f'{date_col}_second']=df[date_col]%60
+            df[f"sin_{date_col}_second"]=np.sin(2*np.pi*df[f'{date_col}_second']/60)
+            df[f"cos_{date_col}_second"]=np.cos(2*np.pi*df[f'{date_col}_second']/60)
+        df[date_col]=df[date_col]//60
+        if timestep=='minute':
+            df[f'{date_col}_minute']=df[date_col]%60
+            df[f"sin_{date_col}_minute"]=np.sin(2*np.pi*df[f'{date_col}_minute']/60)
+            df[f"cos_{date_col}_minute"]=np.cos(2*np.pi*df[f'{date_col}_minute']/60)
+        df[date_col]=df[date_col]//60
+        if timestep=='hour':
+            df[f'{date_col}_hour']=df[date_col]%24
+            df[f"sin_{date_col}_hour"]=np.sin(2*np.pi*df[f'{date_col}_hour']/24)
+            df[f"cos_{date_col}_hour"]=np.cos(2*np.pi*df[f'{date_col}_hour']/24)
+        df[date_col]=df[date_col]//24   
+        if timestep=='day':
+            df[f'{date_col}_day']=df[date_col]%31+1
+            df[f"sin_{date_col}_day"]=np.sin(2*np.pi*df[f'{date_col}_day']/31)
+            df[f"cos_{date_col}_day"]=np.cos(2*np.pi*df[f'{date_col}_day']/31)
+        #month
+        df[f'{date_col}_month']=df[date_col]//31%12+1
+        df[f"sin_{date_col}_month"]=np.sin(2*np.pi*df[f'{date_col}_month']/12)
+        df[f"cos_{date_col}_month"]=np.cos(2*np.pi*df[f'{date_col}_month']/12)
+        #year
+        df[f'{date_col}_year']=df[date_col]//365+1970
+        return df
+
+    #https://www.kaggle.com/code/marketneutral/purged-time-series-cv-xgboost-optuna
+    def purged_cross_validation(self,train_path_or_file:str|pd.DataFrame|pl.DataFrame='train.csv',
+                                test_path_or_file:str|pd.DataFrame|pl.DataFrame='test.csv',
+                                date_col:str='date',train_gap_each_fold:int=31,#one month
+                                train_test_gap:int=7,#a week
+                                train_date_range:int=0,test_date_range:int=0,
+                                category_cols:list[str]=[],
+                                use_seasonal_features:bool=True,
+                                use_weighted_metric:bool=False,
+                                only_inference:bool=False,
+                                timestep:str='day',
+                                target2idx:dict|None=None
+                               ):
+        """
+        train_path_or_file/test_path_or_file:your train and test dataset.
+        date_col                            :timestamp column
+        train_gap_each_fold                 :For example,the start time of fold 0 is 0,
+                                             the start time of fold 1 is 31.
+        train_test_gap                      :the gap between the end of train dataset 
+                                             and the start of test dataset.
+        train_date_range                    :the days of data are included in the train data.
+        test_date_range                     :the days of data are included in the test data.
+        category_cols                       :You can define features that are category_cols.
+        timestep                            :Interval of time series data.'second',
+                                             'minute','hour'or'day'.
+        """
+        
+        if self.use_pseudo_label:
+            raise ValueError("purged CV can't support use pseudo label.")
+        if self.group_col!=None:
+            raise ValueError("purged CV can't support groupkfold.")
+        if len(self.models)==0:
+            raise ValueError("len(models) can't be 0.")
+        if (self.use_optuna_find_params!=0) or (self.optuna_direction!=None):
+            raise ValueError("purged CV can't support optuna find params.")
+        self.train=self.load_data(path_or_file=train_path_or_file,mode='train')
+        if len(self.train.dropna())==0:
+            raise ValueError("At least one row of train data must have no missing values.")
+        self.test=self.load_data(path_or_file=test_path_or_file,mode='test')
+        if len(self.test.dropna())==0:
+            raise ValueError("At least one row of test data must have no missing values.")
+        self.date_col=date_col
+        
+        self.category_cols=category_cols
+        self.target_dtype=self.train[self.target_col].dtype
+        if self.objective!='regression':#check target
+            unique_target=list(self.train[self.target_col].value_counts().to_dict().keys())
+            if unique_target!=list(np.arange(len(unique_target))):
+                raise ValueError(f"purged CV can only support target from 0 to {len(unique_target)-1}")
+        print("< preprocess date_col >")
+        try:#if df[date_col] is string such as '2024-11-08'
+            #transform date to datetime
+            if type(self.train.dropna()[self.date_col].values[0])==str:
+                self.train[self.date_col]=pd.to_datetime(self.train[self.date_col])
+            if type(self.test.dropna()[self.date_col].values[0])==str:
+                self.test[self.date_col]=pd.to_datetime(self.test[self.date_col])
+            #transform 'date' to seconds.
+            self.train[self.date_col]=(self.train[self.date_col]-pd.to_datetime('1970-01-01')).dt.total_seconds()
+            self.test[self.date_col]=(self.test[self.date_col]-pd.to_datetime('1970-01-01')).dt.total_seconds()
+        except:#df[date_col] is [0,1,2,â€¦â€¦,n]
+            min_date=self.train[self.date_col].min()
+            self.train[self.date_col]=self.train[self.date_col]-min_date
+            self.test[self.date_col]=self.test[self.date_col]-min_date
+            #transform (minute,hour,day) to seconds
+            if timestep=='minute':
+                self.train[self.date_col]=self.train[self.date_col]*60
+                self.test[self.date_col]=self.test[self.date_col]*60
+            if timestep=='hour':
+                self.train[self.date_col]=self.train[self.date_col]*3600
+                self.test[self.date_col]=self.test[self.date_col]*3600
+            if timestep=='day':
+                self.train[self.date_col]=self.train[self.date_col]*3600*24
+                self.test[self.date_col]=self.test[self.date_col]*3600*24
+
+        self.train=self.base_FE(self.train,mode='train',drop_cols=self.drop_cols)
+        self.test=self.base_FE(self.test,mode='test',drop_cols=self.drop_cols)
+
+        #Considering that some competitions may anonymize time,
+        #the real year, month, and day features were not extracted here.
+        if use_seasonal_features:
+            self.train=self.construct_seasonal_feature(self.train,self.date_col,timestep)
+            self.test=self.construct_seasonal_feature(self.test,self.date_col,timestep)
+        else:
+            if timestep=='minute':
+                self.train[self.date_col]=self.train[self.date_col]//60
+                self.test[self.date_col]=self.test[self.date_col]//60
+            if timestep=='hour':
+                self.train[self.date_col]=self.train[self.date_col]//3600
+                self.test[self.date_col]=self.test[self.date_col]//3600
+            if timestep=='day':
+                self.train[self.date_col]=self.train[self.date_col]//3600//24
+                self.test[self.date_col]=self.test[self.date_col]//3600//24
+        min_date_col=self.train[self.date_col].min()
+        self.train[self.date_col]-=min_date_col
+        self.test[self.date_col]-=min_date_col
+
+        if test_date_range==0:#date_range same as test_data
+            test_date_range=self.test[self.date_col].max()-self.test[self.date_col].min()+1
+        if train_date_range==0:
+           a=self.train[self.date_col].max()+1-(self.num_folds-1)*train_gap_each_fold-train_test_gap-test_date_range
+           b=self.train[self.date_col].max()+1-self.num_folds*train_gap_each_fold-train_test_gap 
+           train_date_range=min(a,b)
+        #last fold out of index?
+        assert (self.num_folds-1)*train_gap_each_fold+train_date_range+train_test_gap+test_date_range<=self.train[self.date_col].max()+1
+        #final train set out of index?
+        assert self.num_folds*train_gap_each_fold+train_date_range+train_test_gap <=self.train[self.date_col].max()+1
+
+        if self.objective!='regression':
+            y=self.train[self.target_col]
+            self.train[self.target_col]=self.set_target2idx(y,target2idx)
+        
+        self.train.columns=self.colname_clean(list(self.train.columns))
+        self.test.columns=self.colname_clean(list(self.test.columns))
+        self.date_col=self.colname_clean([self.date_col])[0]
+        
+        if not only_inference:
+            self.PrintColor("purged CV")
+            for (model,model_name) in self.models:
+                print(f"{model_name}_params={model.get_params()}")
+            for fold in range(self.num_folds):
+                print(f"fold {fold},model_name:{model_name}")
+                train_date_min=fold*train_gap_each_fold
+                train_date_max=train_date_min+train_date_range
+                test_date_min=train_date_max+train_test_gap
+                test_date_max=test_date_min+test_date_range
+                print(f"train_date_range:[{train_date_min},{train_date_max})")
+                print(f"test_date_range:[{test_date_min},{test_date_max})")
+                
+                train_fold=self.train.copy()[(self.train[self.date_col]>=train_date_min)&(self.train[self.date_col]<train_date_max)]
+                valid_fold=self.train.copy()[(self.train[self.date_col]>=test_date_min)&(self.train[self.date_col]<test_date_max)]
+                
+                X_train=train_fold.drop([self.target_col,self.date_col,self.weight_col],axis=1)
+                y_train=train_fold[self.target_col]
+                X_valid=valid_fold.drop([self.target_col,self.date_col,self.weight_col],axis=1)
+                y_valid=valid_fold[self.target_col]
+                train_weight,valid_weight=train_fold[self.weight_col],valid_fold[self.weight_col]
+                del train_fold,valid_fold
+                gc.collect()
+
+                X_train=self.CV_stat(X_train,y_train,repeat=0,fold=fold)
+                X_valid=self.CV_stat(X_valid,repeat=0,fold=fold)
+                
+                X_train=self.CV_FE(X_train,mode='train',fold=fold)
+                X_valid=self.CV_FE(X_valid,mode='test',fold=fold)
+                
+                CV_score=[]
+                for (model,model_name) in self.models:
+                    if self.exp_mode:#use log transform for target_col
+                        self.exp_mode_b=-y_train.min()
+                        y_train=np.log1p(y_train+self.exp_mode_b)
+                        y_valid=np.log1p(y_valid+self.exp_mode_b)
+
+                    if self.CV_sample!=None:
+                        X_train,y_train,train_weight=self.CV_sample(X_train,y_train,train_weight)
+                    
+                    #don't use early_stop,because final_trainset don't have valid_set.
+                    if 'lgb' in model_name:
+                         #gpu params isn't set
+                        if self.device in ['cuda','gpu']:#gpu mode when training
+                            params=model.get_params()
+                            if (params.get('device',-1)==-1) or (params.get('gpu_use_dp',-1)==-1):
+                                 raise ValueError("The 'device' of lightgbm is 'gpu' and 'gpu_use_dp' must be True.")
+                        model.fit(X_train, y_train,eval_set=[(X_valid, y_valid)],
+                                  sample_weight=train_weight,
+                                  eval_metric=self.lgb_eval_metric if self.use_eval_metric else None,
+                                  callbacks=[log_evaluation(self.log)])
+                    elif 'xgb' in model_name:
+                        #gpu params isn't set
+                        if self.device in ['cuda','gpu']:#gpu mode when training
+                            params=model.get_params()
+                            if (params.get('tree_method',-1)!='gpu_hist'):
+                                 raise ValueError("The 'tree_method' of xgboost must be 'gpu_hist'.")
+                        model.fit(X_train,y_train,eval_set=[(X_valid, y_valid)],
+                                  sample_weight=train_weight,
+                                  eval_metric=self.xgb_eval_metric if self.use_eval_metric else None,
+                                  verbose=self.log)
+                    elif 'cat' in model_name:
+                        #gpu params isn't set
+                        if self.device in ['cuda','gpu']:#gpu mode when training
+                            params=model.get_params()
+                            if (params.get('task_type',-1)==-1):
+                                 raise ValueError("The 'task_type' of catboost must be 'GPU'.")
+                        X_train[self.category_cols]=X_train[self.category_cols].astype('string')
+                        X_valid[self.category_cols]=X_valid[self.category_cols].astype('string')
+                        model.fit(X_train,y_train, eval_set=(X_valid, y_valid),
+                                  sample_weight=train_weight,
+                                  cat_features=self.category_cols,
+                                  verbose=self.log)
+                    elif 'tabnet' in model_name:
+                        cat_idxs,cat_dims=[],[]
+                        X_train_columns=list(X_train.columns)
+                        for idx in range(len(X_train_columns)):
+                            if X_train[X_train_columns[idx]].dtype=='category':
+                                cat_idxs.append(idx)
+                                cat_dims.append(self.train[X_train_columns[idx]].nunique())
+                                X_train[X_train_columns[idx]]=X_train[X_train_columns[idx]].apply(lambda x:int(x)).astype(np.int32)          
+                        params=model.get_params()
+                        params['cat_idxs']=cat_idxs
+                        params['cat_dims']=cat_dims
+                        params['cat_emb_dim']=[5]*len(cat_idxs)
+                        if self.objective=='regression':
+                            model=TabNetRegressor(**params)
+                            model.fit(
+                                X_train.to_numpy(), y_train.to_numpy().reshape(-1,1),
+                                eval_metric=['rmse'],
+                                batch_size=1024,
+                            )
+                        else:
+                            model=TabNetClassifier(**params)
+                            model.fit(
+                                X_train.to_numpy(), y_train.to_numpy(),
+                                batch_size=1024,
+                            )
+                    else:
+                        model.fit(X_train,y_train)
+                    #print feature importance when not use optuna to find params.
+                    if self.plot_feature_importance:
+                        #can only support GBDT.
+                        if ('lgb' in model_name) or ('xgb' in model_name) or ('cat' in model_name):
+                            origin_features=list(X_train.columns)  
+                            feature_importance=model.feature_importances_
+                            #convert to percentage
+                            feature_importance=feature_importance/np.sum(feature_importance)
+                            feat_import_dict={k:v for k,v in zip(origin_features,feature_importance)}
+                            feat_import_dict={k:v for k,v in sorted(feat_import_dict.items(),key=lambda x:-x[1])}
+                            self.pickle_dump(feat_import_dict,self.model_save_path+f'{model_name}_fold{fold}_{self.target_col}_feature_importance.pkl')
+                            bestk,worstk=min(10,int(len(origin_features)*0.1+1)),min(10,int(len(origin_features)*0.1+1))
+                            print(f"top{bestk} best features is :{list(feat_import_dict.keys())[:bestk]}")
+                            print(f"top{worstk} worst features is :{list(feat_import_dict.keys())[-worstk:]}")
+        
+                            #plot feature importance
+                            plt.figure(figsize = (12, 2*bestk/5))
+                            sns.barplot(
+                                y=list(feat_import_dict.keys())[:bestk],
+                                x=list(feat_import_dict.values())[:bestk],
+                            )
+                            plt.title(f"{model_name} fold {fold} top{bestk} best Feature Importance")
+                            plt.show()
+                    if self.objective=='regression':
+                        valid_pred=self.predict_batch(model=model,test_X=X_valid)
+                    else:
+                        valid_pred=self.predict_proba_batch(model=model,test_X=X_valid)
+                    if self.exp_mode:
+                        y_train=np.expm1(y_train)-self.exp_mode_b
+                        valid_pred=np.expm1(valid_pred)-self.exp_mode_b
+                        y_valid=np.expm1(y_valid)-self.exp_mode_b
+                    if self.save_oof_preds:#if oof_preds is needed
+                        np.save(self.model_save_path+f"{model_name}_seed{self.seed}_fold{fold}_{self.target_col}_target.npy",y_valid.values)
+                        np.save(self.model_save_path+f"{model_name}_seed{self.seed}_fold{fold}_{self.target_col}_valid_pred.npy",valid_pred)
+                    
+                    if use_weighted_metric:#only support custom_metric
+                        CV_score.append(self.Metric(y_valid,valid_pred,valid_weight))
+                    else:
+                        CV_score.append(self.Metric(y_valid,valid_pred)) 
+
+                    if 'tabnet' not in model_name:
+                        self.pickle_dump(model,self.model_save_path+f'{model_name}_fold{fold}_{self.target_col}.model')
+                    metric=self.metric if self.custom_metric==None else self.custom_metric.__name__
+                    print(f"{metric}:{CV_score[-1]}")
+                self.PrintColor(f"mean_{metric}------------------------------>{np.mean(CV_score)}",color = Fore.RED)
+                del X_train,y_train,X_valid,y_valid,valid_pred,train_weight,valid_weight
+                gc.collect()
+                
+        self.PrintColor("prediction on test data")
+        train_date_min=self.train[self.date_col].max()-train_test_gap-train_date_range+1
+        train_date_max=self.train[self.date_col].max()-train_test_gap+1
+        print(f"train_date_range:[{train_date_min},{train_date_max})")
+        train=self.train[(self.train[self.date_col]>=train_date_min)&(self.train[self.date_col]<train_date_max)]
+        train_weight=train[self.weight_col]
+        X_train=train.drop([self.target_col,self.date_col,self.weight_col],axis=1)
+        y_train=train[self.target_col]
+        del train
+        gc.collect()
+        
+        test_X=self.test.drop([self.date_col],axis=1)
+
+        X_train=self.CV_stat(X_train,y_train,repeat=0,fold=self.num_folds)
+        test_X=self.CV_stat(test_X,repeat=0,fold=self.num_folds)
+        
+        X_train=self.CV_FE(X_train,mode='train',fold=self.num_folds)
+        test_X=self.CV_FE(test_X,mode='test',fold=self.num_folds)
+        
+        if self.exp_mode:#use log transform for target_col
+            self.exp_mode_b=-y_train.min()
+            y_train=np.log1p(y_train+self.exp_mode_b)
+
+        if self.CV_sample!=None:
+            X_train,y_train,train_weight=self.CV_sample(X_train,y_train,train_weight)
+        
+        test_preds=[]
+        for model,model_name in self.models:
+            X_train[self.category_cols]=X_train[self.category_cols].astype('category')
+            #don't use early_stop,because final_trainset don't have valid_set.
+            if 'lgb' in model_name:
+                model.fit(X_train, y_train,sample_weight=train_weight,
+                          callbacks=[log_evaluation(self.log)])
+            elif 'xgb' in model_name:
+                model.fit(X_train,y_train,sample_weight=train_weight,
+                          verbose=self.log)
+            elif 'cat' in model_name:
+                X_train[self.category_cols]=X_train[self.category_cols].astype('string')
+                model.fit(X_train,y_train, cat_features=self.category_cols,
+                          sample_weight=train_weight,
+                          verbose=self.log)
+            elif 'tabnet' in model_name:
+                cat_idxs,cat_dims=[],[]
+                X_train_columns=list(X_train.columns)
+                for idx in range(len(X_train_columns)):
+                    if X_train[X_train_columns[idx]].dtype=='category':
+                        cat_idxs.append(idx)
+                        cat_dims.append(self.train[X_train_columns[idx]].nunique())
+                        X_train[X_train_columns[idx]]=X_train[X_train_columns[idx]].apply(lambda x:int(x)).astype(np.int32)      
+                         
+                params=model.get_params()
+                params['cat_idxs']=cat_idxs
+                params['cat_dims']=cat_dims
+                params['cat_emb_dim']=[5]*len(cat_idxs)
+
+                if self.objective=='regression':
+                    model=TabNetRegressor(**params)
+                    model.fit(
+                            X_train.to_numpy(), y_train.to_numpy().reshape(-1,1),
+                            eval_metric=['rmse'],
+                            batch_size=1024,
+                        )
+                else:
+                    model=TabNetClassifier(**params)
+                    model.fit(
+                            X_train.to_numpy(), y_train.to_numpy(),
+                            batch_size=1024,
+                        )
+            else:
+                model.fit(X_train,y_train)
+            self.pickle_dump(model,self.model_save_path+f'{model_name}_fold{self.num_folds}_{self.target_col}.model')
+            #inference
+            if self.objective=='regression':
+                test_pred=self.predict_batch(model=model,test_X=test_X)
+            else:
+                test_pred=self.predict_proba_batch(model=model,test_X=test_X)
+            test_preds.append(test_pred)
+        if self.save_test_preds:#True
+            np.save(self.model_save_path+f'_{self.target_col}_test_preds.npy',test_preds)
+        test_preds=np.mean(test_preds,axis=0)
+        if self.objective!='regression':
+            if self.metric=='auc':
+                test_preds=test_preds[:,1]
+            else:
+                test_preds=np.argmax(test_preds,axis=1)
+        if self.exp_mode:
+            test_preds=np.expm1(test_preds)-self.exp_mode_b
+        return test_preds
+
+    #https://www.kaggle.com/competitions/home-credit-credit-risk-model-stability/discussion/501577
+    def lgb_eval_metric(self,y_true,y_pred):
+        if self.exp_mode:
+            y_true,y_pred=np.expm1(y_true)-self.exp_mode_b,np.expm1(y_pred)-self.exp_mode_b
+        score=self.Metric(y_true,y_pred)
+        if self.custom_metric!=None:
+            return self.custom_metric.__name__,score, bool(self.optuna_direction=='maximize')
+        else:
+            direction='minimize'
+            if self.metric in self.direction2metric['maximize']:
+                direction='maximize'
+            return self.metric,score, bool(direction=='maximize')
+    def xgb_eval_metric(self,y_pred,y_true):
+        y_true=y_true.get_label()
+        if self.exp_mode:
+            y_true,y_pred=np.expm1(y_true)-self.exp_mode_b,np.expm1(y_pred)-self.exp_mode_b
+        score=self.Metric(y_true,y_pred)
+        if self.custom_metric!=None:
+            return self.custom_metric.__name__,score
+        else:
+            return self.metric,score
+    
+    # return oof_preds and metric_score
+    # can use optuna to find params.If use optuna,then not save models.
+    def cross_validation(self,X:pd.DataFrame,y:pd.DataFrame,group,kf_folds:pd.DataFrame,
+                         model,model_name,sample_weight,use_optuna,repeat:int=0,
+                         num_folds=5,CV_FE=None,
+                         num_classes=None,objective='regression',
+                         log=100,use_pseudo_label:bool=False,
+                         test=None,group_col=None,target_col:str='target',
+                         category_cols=[],
+                         use_data_augmentation:bool=False,
+                         CV_stat=None,
+                         CV_sample=None,device:str='cpu',
+                         early_stop:int=100,use_eval_metric:bool=False,
+                         lgb_eval_metric=None,xgb_eval_metric=None,
+                         plot_feature_importance:bool=False,
+                         exp_mode:bool=False,exp_mode_b:int=0,
+                         use_CIR:bool=False,metric=None,Metric=None,
+                        ):
+        if use_optuna:
+            log=10000
+        if objective=='regression':
+            oof_preds=np.zeros(len(y))
+        else:
+            oof_preds=np.zeros((len(y),num_classes))
+        for fold in tqdm(range(num_folds)):
+            train_index=kf_folds[kf_folds['fold']!=fold].index
+            valid_index=kf_folds[kf_folds['fold']==fold].index
+            print(f"name:{model_name},fold:{fold}")
+
+            X_train, X_valid = X.iloc[train_index].reset_index(drop=True), X.iloc[valid_index].reset_index(drop=True)
+            y_train, y_valid = y.iloc[train_index].reset_index(drop=True), y.iloc[valid_index].reset_index(drop=True)
+
+            if CV_stat!=None:
+                X_train=CV_stat(X=X_train,y=y_train,fold=fold,repeat=repeat )
+                X_valid=CV_stat(X=X_valid,fold=fold,repeat=repeat)
+            
+            if CV_FE!=None:
+                X_train=CV_FE(X_train,mode='train',fold=fold,repeat=repeat)
+                X_valid=CV_FE(X_valid,mode='test',fold=fold,repeat=repeat)
+            sample_weight_train=sample_weight.iloc[train_index].reset_index(drop=True)
+            sample_weight_valid=sample_weight.iloc[valid_index].reset_index(drop=True)
+
+            if (use_pseudo_label) and (type(test)==pd.DataFrame):
+                if CV_FE!=None:
+                    test_copy=CV_FE(test.copy(),mode='test',fold=fold,repeat=repeat)
+                test_X=test_copy.drop([group_col,target_col],axis=1,errors='ignore')
+                test_y=test_copy[target_col]
+                
+                #concat will transform 'category' to 'object'
+                X_train=pd.concat((X_train,test_X),axis=0)
+                X_train[category_cols]=X_train[category_cols].astype('category')
+                y_train=pd.concat((y_train,test_y),axis=0)
+                sample_weight_train=pd.concat((sample_weight_train,pd.DataFrame({'weight':np.ones(len(test_X))*0.5})['weight']))
+                
+                del test_X,test_copy
+                gc.collect()
+                
+            if use_data_augmentation:#X_train,y_train,sample_weight_train
+                aug_data=self.pca_augmentation(X_train,y_train,target_col)
+                
+                #concat origin_data aug_data
+                X_train=pd.concat((X_train,aug_data[X_train.columns]),axis=0)
+                X_train[category_cols]=X_train[category_cols].astype('category')
+                y_train=pd.concat((y_train,y_train),axis=0)
+                sample_weight_train=pd.concat((sample_weight_train,sample_weight_train),axis=0)
+
+                del aug_data
+                gc.collect()
+
+            if CV_sample!=None:
+                X_train,y_train,X_valid,y_valid,sample_weight_train,sample_weight_valid=\
+                    CV_sample(X_train,y_train,X_valid,y_valid,sample_weight_train,sample_weight_valid)
+                
+            if 'lgb' in model_name:
+                #gpu params isn't set
+                if device in ['cuda','gpu']:#gpu mode when training
+                    params=model.get_params()
+                    if (params.get('device',-1)==-1) or (params.get('gpu_use_dp',-1)==-1):
+                         raise ValueError("The 'device' of lightgbm is 'gpu' and 'gpu_use_dp' must be True.")
+                model.fit(X_train,y_train,eval_set=[(X_valid, y_valid)],
+                         sample_weight=sample_weight_train,
+                         eval_metric=lgb_eval_metric if use_eval_metric else None,
+                         categorical_feature=category_cols,
+                         callbacks=[log_evaluation(log),early_stopping(early_stop)]
+                    )
+            elif 'cat' in model_name:
+                #gpu params isn't set
+                if device in ['cuda','gpu']:#gpu mode when training
+                    params=model.get_params()
+                    if (params.get('task_type',-1)==-1):
+                         raise ValueError("The 'task_type' of catboost must be 'GPU'.")
+                X_train[category_cols]=X_train[category_cols].astype('string')
+                X_valid[category_cols]=X_valid[category_cols].astype('string')
+                model.fit(X_train, y_train,
+                      eval_set=(X_valid, y_valid),
+                      cat_features=category_cols,
+                      sample_weight=sample_weight_train,
+                      early_stopping_rounds=early_stop, verbose=log)
+            elif 'xgb' in model_name: 
+                #gpu params isn't set
+                if device in ['cuda','gpu']:#gpu mode when training
+                    params=model.get_params()
+                    if (params.get('tree_method',-1)!='gpu_hist'):
+                         raise ValueError("The 'tree_method' of xgboost must be 'gpu_hist'.")
+                model.fit(X_train,y_train,eval_set=[(X_valid, y_valid)],
+                          sample_weight=sample_weight_train,
+                          eval_metric=xgb_eval_metric if use_eval_metric else None,
+                          verbose=log)
+            elif 'tabnet' in model_name:
+                 cat_idxs,cat_dims=[],[]
+                 X_train_columns=list(X_train.columns)
+                 for idx in range(len(X_train_columns)):
+                     if X_train[X_train_columns[idx]].dtype=='category':
+                         cat_idxs.append(idx)
+                         cat_dims.append(X[X_train_columns[idx]].nunique())
+                         X_train[X_train_columns[idx]]=X_train[X_train_columns[idx]].apply(lambda x:int(x)).astype(np.int32)      
+                         X_valid[X_train_columns[idx]]=X_valid[X_train_columns[idx]].apply(lambda x:int(x)).astype(np.int32)      
+                 params=model.get_params()
+                 params['cat_idxs']=cat_idxs
+                 params['cat_dims']=cat_dims
+                 params['cat_emb_dim']=[5]*len(cat_idxs)
+                 if objective=='regression':
+                     model=TabNetRegressor(**params)
+                     model.fit(
+                        X_train.to_numpy(), y_train.to_numpy().reshape(-1,1),
+                        eval_metric=['rmse'],
+                        eval_set=[(X_valid.to_numpy(), y_valid.to_numpy().reshape(-1,1) ) ],
+                        batch_size=1024,
+                    )
+                 else:
+                     model=TabNetClassifier(**params)
+                     model.fit(
+                        X_train.to_numpy(), y_train.to_numpy(),
+                        eval_set=[(X_valid.to_numpy(), y_valid.to_numpy())],
+                        batch_size=1024,
+                    )
+            else:#other models such as ridge,LinearRegression,LogisticRegression,
+                model.fit(X_train,y_train) 
+
+            #print feature importance when not use optuna to find params.
+            if (use_optuna==False) and (plot_feature_importance):
+                #can only support GBDT.
+                if ('lgb' in model_name) or ('xgb' in model_name) or ('cat' in model_name):
+                    origin_features=list(X_train.columns)
+                            
+                    feature_importance=model.feature_importances_
+                    #convert to percentage
+                    feature_importance=feature_importance/np.sum(feature_importance)
+                    feat_import_dict={k:v for k,v in zip(origin_features,feature_importance)}
+                    feat_import_dict={k:v for k,v in sorted(feat_import_dict.items(),key=lambda x:-x[1])}
+                    self.pickle_dump(feat_import_dict,self.model_save_path+f'{model_name}_repeat{repeat}_fold{fold}_{self.target_col}_feature_importance.pkl')
+                    bestk,worstk=min(10,int(len(origin_features)*0.1+1)),min(10,int(len(origin_features)*0.1+1))
+                    print(f"top{bestk} best features is :{list(feat_import_dict.keys())[:bestk]}")
+                    print(f"top{worstk} worst features is :{list(feat_import_dict.keys())[-worstk:]}")
+
+                    #plot feature importance
+                    plt.figure(figsize = (12, 2*bestk/5))
+                    sns.barplot(
+                        y=list(feat_import_dict.keys())[:bestk],
+                        x=list(feat_import_dict.values())[:bestk],
+                    )
+                    plt.title(f"{model_name} fold {fold} top{bestk} best Feature Importance")
+                    plt.show()
+            
+            if objective=='regression':
+                if 'tabnet' not in model_name:
+                    oof_preds[valid_index]=model.predict(X_valid)
+                else:#tabnet
+                    oof_preds[valid_index]=model.predict(X_valid.to_numpy()).reshape(-1)
+            else:
+                if 'tabnet' not in model_name:
+                    oof_preds[valid_index]=model.predict_proba(X_valid)
+                else:#tabnet
+                    oof_preds[valid_index]=model.predict_proba(X_valid.to_numpy())
+            if not use_optuna:#not find_params(training)
+                if 'tabnet' not in model_name:
+                    self.pickle_dump(model,self.model_save_path+f'{model_name}_repeat{repeat}_fold{fold}_{self.target_col}.model')
+                self.trained_models.append(copy.deepcopy(model))
+            
+            del X_train,y_train,X_valid,y_valid
+            gc.collect()
+        y=y.values
+        if exp_mode:#y and oof need expm1.
+            y=np.expm1(y)-exp_mode_b
+            oof_preds=np.expm1(oof_preds)-exp_mode_b
+        if use_CIR:
+            print(f"{metric} before CIR:{Metric(y,oof_preds)}")
+            CIR=CenteredIsotonicRegression().fit(oof_preds,y)
+            oof_preds=CIR.transform(oof_preds)
+            #save CIR models
+            self.pickle_dump(CIR,self.model_save_path+f'CIR_{model_name}_repeat{repeat}_fold{fold}_{self.target_col}.model')
+            self.trained_CIR.append(copy.deepcopy(CIR))
+            del CIR
+            gc.collect()
+        
+        metric_score=Metric(y,oof_preds)
+        return oof_preds,metric_score
+
+    #https://www.kaggle.com/code/carlmcbrideellis/what-is-adversarial-validation
+    #This function does not perform any feature engineering.
+    def adversarial_validation(self,train:pd.DataFrame,test:pd.DataFrame,
+                                    target_col:str='target'):
+        train,test=train.copy(),test.copy()
+        #drop object cols
+        object_cols=[col for col in train.columns if col!=target_col and train[col].dtype==object]
+        train.drop(object_cols,axis=1,inplace=True)
+        test.drop(object_cols,axis=1,inplace=True)
+
+        train.drop([target_col],axis=1,inplace=True)
+        test.drop([target_col],axis=1,inplace=True,errors='ignore')
+        train['is_test']=0
+        test['is_test']=1
+        total=pd.concat((train,test))
+        X=total.drop(['is_test'],axis=1)
+        y=total['is_test']
+        sample_weight=pd.DataFrame({"weight":np.ones(len(y))})['weight']
+        kf=StratifiedKFold(n_splits=5,random_state=self.seed,shuffle=True)     
+        kf_folds=pd.DataFrame({"fold":np.zeros(len(y))})
+        for fold, (train_index, valid_index) in (enumerate(kf.split(X,y))):
+            kf_folds['fold'][valid_index]=fold
+
+        temp_metric,temp_objective,temp_num_classes=self.metric,self.objective,self.num_classes
+        self.metric,self.objective,self.num_classes='auc','binary',2
+        
+        oof_preds,metric_score=self.cross_validation(X=X,y=y,group=None,kf_folds=kf_folds,
+                         model=LGBMClassifier(n_estimators=256,metric='auc',
+                                              colsample_bytree=0.8,colsample_bynode=0.8),
+                         model_name='lgb_adversarial_validation',
+                         sample_weight=sample_weight,
+                         use_optuna=False,repeat=0,num_folds=5,CV_FE=None,
+                         num_classes=2,objective='binary',
+                         log=100,use_pseudo_label=False,
+                         test=None,group_col=None,target_col='is_test',
+                         category_cols=[],device=self.device,
+                         early_stop=100,plot_feature_importance=True,
+                         metric='auc',Metric=self.Metric
+                        )
+        self.PrintColor(f"{self.metric}------------------------------>{metric_score}",color = Fore.RED)
+
+        self.metric,self.objective,self.num_classes=temp_metric,temp_objective,temp_num_classes
+        self.trained_models=[]
+    
+    def drop_high_correlation_feats(self,df:pd.DataFrame)->None:
+        #target_col and group_col is for model training,don't delete.object feature is string.
+        #Here we choose 0.99,other feature with high correlation can use Dimensionality reduction such as PCA.
+        #if you want to delete other feature with high correlation,add into drop_cols when init.
+        numerical_cols=[col for col in df.columns \
+                        if (col not in [self.target_col,self.group_col,self.weight_col]) \
+                        and str(df[col].dtype) not in ['object','category']]
+        corr_matrix=df[numerical_cols].corr().values
+        drop_cols=[]
+        for i in range(len(corr_matrix)):
+            #time series data
+            #bg0 and bg1 have correlation of 0.99,â€¦â€¦,bg{n-1} and bg{n} have correlation of 0.99,
+            #if don't add this,we will drop([bg1,â€¦â€¦,bgn]),although bg0 and bgn have a low correlation.
+            if numerical_cols[i] not in drop_cols:
+                for j in range(i+1,len(corr_matrix)):
+                    if numerical_cols[j]  not in drop_cols:
+                        if abs(corr_matrix[i][j])>=0.99:
+                            drop_cols.append(numerical_cols[j])
+        #add drop_cols to self.drop_cols,they will be dropped in the final part of the function base_FE.
+        print(f"drop_cols={drop_cols}")
+        del numerical_cols
+        gc.collect()
+        return drop_cols
+
+    #binary or multi_class
+    def set_target2idx(self,y:pd.DataFrame,target2idx:dict|None=None):
+        #use your custom target2idx  when objective=='binary' or 'multi_class'
+        self.use_custom_target2idx=(type(target2idx)==dict)
+        if self.use_custom_target2idx:#use your custom target2idx
+            self.target2idx=target2idx
+        else:
+            self.target2idx={}
+            y_unique=list(y.value_counts().to_dict().keys())
+            for idx in range(len(y_unique)):
+                self.target2idx[y_unique[idx]]=idx
+        #deal with {0:1,1:0}
+        if self.target2idx=={0:1,1:0}:
+            self.target2idx={0:0,1:1}
+
+        self.idx2target={}
+        for tgt,idx in self.target2idx.items():
+                self.idx2target[idx]=tgt
+            
+        y=y.apply(lambda k:self.target2idx[k])
+        return y
+    
+    def fit(self,train_path_or_file:str|pd.DataFrame|pl.DataFrame='train.csv',
+            category_cols:list[str]=[],date_cols:list[str]=[],
+            target2idx:dict|None=None,
+           ):
+        if self.num_folds<2:#kfold must greater than 1
+            raise ValueError("num_folds must be greater than 1.")
+        #lightgbm:https://github.com/microsoft/LightGBM/blob/master/python-package/lightgbm/sklearn.py
+        #xgboost:https://github.com/dmlc/xgboost/blob/master/python-package/xgboost/sklearn.py
+        #category_cols:Convert string columns to 'category'.
+        self.category_cols=category_cols
+        self.date_cols=date_cols
+        self.PrintColor("fit......",color=Fore.GREEN)
+        self.PrintColor("load train data")
+        self.train=self.load_data(path_or_file=train_path_or_file,mode='train')
+        #process date_cols
+        for date_col in self.date_cols:
+            self.train[date_col]=pd.to_datetime(self.train[date_col])
+            self.train[date_col]=(self.train[date_col]-pd.to_datetime('1970-01-01')).dt.total_seconds()
+            self.train=self.construct_seasonal_feature(self.train,date_col,timestep='day')
+        self.train.drop(self.date_cols,axis=1,inplace=True)   
+        
+        self.sample_weight=self.train[self.weight_col]
+        self.train.drop([self.weight_col],axis=1,inplace=True)
+        self.target_dtype=self.train[self.target_col].dtype
+        try:#deal with TypeError: unhashable type: 'list'
+            self.train=self.train.drop_duplicates()
+        except:
+            pass
+        self.PrintColor("Feature Engineer")
+        self.train=self.base_FE(self.train,mode='train',drop_cols=self.drop_cols)
+        X=self.train.drop([self.group_col,self.target_col],axis=1,errors='ignore')
+        X.columns=self.colname_clean(list(X.columns))
+        print(f"train.shape:{X.shape}")
+        y=self.train[self.target_col]
+        
+        #special characters in columns'name will lead to errors when GBDT model training.
+        X_columns=list(X.columns)
+        print(f"feature_count:{len(X_columns)}")
+                
+        #classification:target2idx,idx2target
+        if self.objective!='regression':
+            y=self.set_target2idx(y,target2idx)
+
+        #save true label in train data to calculate final score 
+        self.features=X
+        self.target=y.values
+        
+        if self.exp_mode:#use log transform for target_col
+            self.exp_mode_b=-y.min()
+            y=np.log1p(y+self.exp_mode_b)
+        
+        if self.group_col!=None:
+            group=self.train[self.group_col]
+        else:
+            group=None
+        
+        #if you don't use your own models,then use built-in models.
+        self.PrintColor("load models")
+        if len(self.models)==0:
+            
+            metric=self.metric
+            if self.objective=='multi_class':
+                metric='multi_logloss'
+            #lightgbm don't support f1_score,but we will calculate f1_score as Metric.
+            if metric in ['f1_score','mcc','logloss','pr_auc','accuracy']:
+                metric='auc'
+            elif metric in ['medae','mape','smape']:
+                metric='mae'
+            elif metric in ['rmsle','msle','r2']:
+                metric='mse'
+            if self.custom_metric!=None:
+                if self.objective=='regression':
+                    metric='rmse'
+                elif self.objective=='binary':
+                    metric='auc'
+                elif self.objective=='multi_class':
+                    metric='multi_logloss'
+            lgb_params={"boosting_type": "gbdt","metric": metric,
+                        'random_state': self.seed,  "max_depth": 10,"learning_rate": 0.1,
+                        "n_estimators": 20000,"colsample_bytree": 0.6,"colsample_bynode": 0.6,"verbose": -1,"reg_alpha": 0.2,
+                        "reg_lambda": 5,"extra_trees":True,'num_leaves':64,"max_bin":255,
+                        'importance_type': 'gain',#better than 'split'
+                        }
+            #find new params then use optuna
+            if self.use_optuna_find_params:
+                #choose cross validation
+                if self.objective!='regression':
+                    if self.group_col!=None:#group
+                        kf=StratifiedGroupKFold(n_splits=self.num_folds,random_state=self.seed,shuffle=True)
+                    else:
+                        kf=StratifiedKFold(n_splits=self.num_folds,random_state=self.seed,shuffle=True)
+                else:#regression
+                    if self.group_col!=None:#group
+                        kf=GroupKFold(n_splits=self.num_folds)
+                    else:
+                        kf=KFold(n_splits=self.num_folds,random_state=self.seed,shuffle=True)
+                kf_folds=pd.DataFrame({"fold":np.zeros(len(y))})
+                for fold, (train_index, valid_index) in (enumerate(kf.split(X,y,group))):
+                    kf_folds['fold'][valid_index]=fold
+                lgb_params=self.optuna_lgb(X=X,y=y,group=group,kf_folds=kf_folds,metric=metric)
+             
+            #catboost's metric
+            # Valid options are:  'CrossEntropy', 'CtrFactor', 'Focal', 'RMSE', 'LogCosh', 
+            # 'Lq','Quantile', 'MultiQuantile', 'Expectile', 'LogLinQuantile',
+            # 'Poisson', 'MSLE', 'MedianAbsoluteError', 'Huber', 'Tweedie', 'Cox', 
+            # 'RMSEWithUncertainty', 'MultiClass', 'MultiClassOneVsAll', 'PairLogit', 'PairLogitPairwise',
+            # 'YetiRank', 'YetiRankPairwise', 'QueryRMSE', 'GroupQuantile', 'QuerySoftMax', 
+            # 'QueryCrossEntropy', 'StochasticFilter', 'LambdaMart', 'StochasticRank', 
+            # 'PythonUserDefinedPerObject', 'PythonUserDefinedMultiTarget', 'UserPerObjMetric',
+            # 'UserQuerywiseMetric','NumErrors', 'FairLoss', 'BalancedAccuracy','Combination',
+            # 'BalancedErrorRate', 'BrierScore', 'Precision', 'Recall', 'TotalF1', 'F', 'MCC', 
+            # 'ZeroOneLoss', 'HammingLoss', 'HingeLoss', 'Kappa', 'WKappa', 'LogLikelihoodOfPrediction',
+            # 'NormalizedGini','PairAccuracy', 'AverageGain', 'QueryAverage', 'QueryAUC',
+            # 'PFound', 'PrecisionAt', 'RecallAt', 'MAP', 'NDCG', 'DCG', 'FilteredDCG', 'MRR', 'ERR', 
+            # 'SurvivalAft', 'MultiRMSE', 'MultiRMSEWithMissingValues', 'MultiLogloss', 'MultiCrossEntropy',
+
+            #catboost metric to params
+            metric2params={#regression
+                          'mse':'RMSE','rmsle':'RMSE','msle':'MSLE','rmse':'RMSE',
+                           'mae':'MAE','medae':'MAE','mape':'MAPE','r2':'R2','smape':'SMAPE',
+                          #classification
+                           'accuracy':'Accuracy','logloss':'Logloss','multi_logloss':'Accuracy',
+                           'f1_score':'F1','auc':'AUC','mcc':'MCC','pr_auc':'PRAUC',
+                          }
+            metric=metric2params.get(self.metric,'None')
+            
+            if self.custom_metric!=None:#use your custom_metric
+                if self.objective=='regression':
+                    metric='RMSE'
+                elif self.objective=='binary':
+                    metric='Logloss'
+                else:
+                    metric='Accuracy'
+                    
+            cat_params={
+                       'random_state':self.seed,
+                       'eval_metric'         : metric,
+                       'bagging_temperature' : 0.50,
+                       'iterations'          : 20000,
+                       'learning_rate'       : 0.1,
+                       'max_depth'           : 12,
+                       'l2_leaf_reg'         : 1.25,
+                       'min_data_in_leaf'    : 24,
+                       'random_strength'     : 0.25, 
+                       'verbose'             : 0,
+                      }
+            xgb_params={'random_state': self.seed, 'n_estimators': 20000, 
+                        'learning_rate': 0.1, 'max_depth': 10,
+                        'reg_alpha': 0.08, 'reg_lambda': 0.8, 
+                        'subsample': 0.95, 'colsample_bytree': 0.6, 
+                        'min_child_weight': 3,'early_stopping_rounds':self.early_stop,
+                        'enable_categorical':True,
+                       }
+
+            if self.device in ['cuda','gpu']:#gpu's name
+                lgb_params['device']='gpu'
+                lgb_params['gpu_use_dp']=True
+                cat_params['task_type']="GPU"
+                xgb_params['tree_method']='gpu_hist'
+            else:#self.device=='cpu'
+                lgb_params['n_jobs']=-1
+                xgb_params['n_jobs']=-1
+                
+            if self.objective=='regression':
+                self.models=[(LGBMRegressor(**lgb_params),'lgb'),
+                             (CatBoostRegressor(**cat_params),'cat'),
+                             (XGBRegressor(**xgb_params),'xgb')
+                            ]
+            else:
+                self.models=[(LGBMClassifier(**lgb_params),'lgb'),
+                             (CatBoostClassifier(**cat_params),'cat'),
+                             (XGBClassifier(**xgb_params),'xgb'),
+                            ]
+
+        for repeat in range(self.n_repeats):
+            #choose cross validation
+            if self.objective!='regression':
+                if self.group_col!=None:#group
+                    kf=StratifiedGroupKFold(n_splits=self.num_folds,random_state=self.seed+repeat,shuffle=True)
+                else:
+                    kf=StratifiedKFold(n_splits=self.num_folds,random_state=self.seed+repeat,shuffle=True)
+            else:#regression
+                if self.group_col!=None:#group
+                    kf=GroupKFold(n_splits=self.num_folds)
+                else:
+                    kf=KFold(n_splits=self.num_folds,random_state=self.seed+repeat,shuffle=True)
+            kf_folds=pd.DataFrame({"fold":np.zeros(len(y))})
+            #use groupkfoldshuffle
+            if (self.group_col!=None) and self.objective=='regression':
+                unique_group=sorted(group.unique())
+                random_group=unique_group.copy()
+                np.random.shuffle(random_group)
+                random_map={k:v for k,v in zip(unique_group,random_group)}
+                group=group.apply(lambda x:random_map[x])
+                group=group.sort_values()
+                X=X.loc[list(group.index)]
+                y=y.loc[list(group.index)]
+                del unique_group,random_group,random_map
+                gc.collect()
+                
+            for fold, (train_index, valid_index) in (enumerate(kf.split(X,y,group))):
+                kf_folds['fold'][valid_index]=fold
+            #sort_index
+            if (self.group_col!=None):
+                X,y=X.sort_index(),y.sort_index()
+                group,kf_folds=group.sort_index(),kf_folds.sort_index()
+            
+            #check params and update
+            for i in range(len(self.models)):
+                model,model_name=self.models[i]
+                if 'lgb' in model_name or 'xgb' in model_name or 'cat' in model_name:
+                    params=model.get_params()
+                    params['random_state']=self.seed+repeat
+                    model.set_params(**params)
+                self.models[i]=(model,model_name)
+                print(f"{self.models[i][1]}_params:{self.models[i][0].get_params()}")  
+                
+            self.PrintColor("model training")
+            for (model,model_name) in self.models:
+                oof_preds,metric_score=self.cross_validation(X=X,y=y,group=group,repeat=repeat,kf_folds=kf_folds,
+                                                             model=copy.deepcopy(model),model_name=model_name,
+                                                             sample_weight=self.sample_weight,use_optuna=False,
+                                                             num_folds=self.num_folds,CV_FE=self.CV_FE,
+                                                             num_classes=self.num_classes,objective=self.objective,
+                                                             log=self.log,use_pseudo_label=self.use_pseudo_label,
+                                                             test=self.test,group_col=self.group_col,target_col=self.target_col,
+                                                             category_cols=self.category_cols,
+                                                             CV_stat=self.CV_stat,
+                                                             use_data_augmentation=self.use_data_augmentation,
+                                                             CV_sample=self.CV_sample,device=self.device,
+                                                             early_stop=self.early_stop,use_eval_metric=self.use_eval_metric,
+                                                             lgb_eval_metric=self.lgb_eval_metric,xgb_eval_metric=self.xgb_eval_metric,
+                                                             plot_feature_importance=self.plot_feature_importance,
+                                                             exp_mode=self.exp_mode,exp_mode_b=self.exp_mode_b,
+                                                             use_CIR=self.use_CIR,metric=self.metric,Metric=self.Metric
+                                                            )
+                if self.use_oof_as_feature:
+                    if self.objective=='regression':
+                        X[f'{model_name}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_oof_preds']=oof_preds
+                        self.train[f'{model_name}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_oof_preds']=oof_preds
+                    else:
+                        for c in range(self.num_classes):
+                            X[f'{model_name}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_oof_preds_class{c}']=oof_preds[:,c]
+                            self.train[f'{model_name}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_oof_preds_class{c}']=oof_preds[:,c]
+
+                metric=self.metric if self.custom_metric==None else self.custom_metric.__name__
+                self.PrintColor(f"{metric}------------------------------>{metric_score}",color = Fore.RED)
+
+                if self.save_oof_preds:#if oof_preds is needed
+                    np.save(self.model_save_path+f"{model_name}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_{self.target_col}.npy",oof_preds)
+
+    #calculate each model cross validation metric scores.
+    def CVMetricsSummary(self,):
+        if self.objective=='regression':
+            metrics=self.reg_metric
+        else:
+            metrics=self.cla_metric
+        temp_metric=self.metric
+        
+        summary_df=pd.DataFrame(np.zeros((0,len(self.models))))
+        summary_df.columns=[model_name for (model,model_name) in self.models]
+        for modeli in range(len(self.models)):
+            oof_preds=np.zeros_like(np.load(self.model_save_path+f"{self.models[0//self.num_folds][1]}_seed{self.seed}_repeat0_fold{self.num_folds}_{self.target_col}.npy"))
+            for repeat in range(self.n_repeats):
+                oof_preds+=np.load(self.model_save_path+f"{self.models[modeli][1]}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_{self.target_col}.npy")
+            oof_preds=oof_preds/self.n_repeats
+            for metrici in range(len(metrics)):
+                self.metric=metrics[metrici]
+                try:
+                    #calculate each metric
+                    summary_df.loc[self.metric,self.models[modeli][1]]=self.Metric(self.target,oof_preds) 
+                except:
+                    summary_df.loc[self.metric,self.models[modeli][1]]=np.nan
+        self.metric=temp_metric
+        return summary_df
+    
+    def cal_final_score(self,weights):
+        #calculate oof score if save_oof_preds
+        if self.save_oof_preds:
+            for repeat in range(self.n_repeats):
+                oof_preds=np.zeros_like(np.load(self.model_save_path+f"{self.models[0//self.num_folds][1]}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_{self.target_col}.npy"))
+                for i in range(0,len(weights)//self.n_repeats,self.num_folds):
+                    oof_pred=np.load(self.model_save_path+f"{self.models[i//self.num_folds][1]}_seed{self.seed}_repeat{repeat}_fold{self.num_folds}_{self.target_col}.npy")
+                    oof_preds+=weights[i+repeat*self.num_folds]*oof_pred
+                oof_preds=oof_preds/len(self.models)
+                metric=self.metric if self.custom_metric==None else self.custom_metric.__name__
+                print(f"final_repeat{repeat}_{metric}:{self.Metric(self.target,oof_preds)}")
+
+    #regression/classification
+    def predict_batch(self,model,test_X):
+        test_preds=np.zeros((len(test_X)))
+        if 'catboost' in str(type(model)):#catboost
+            test_X[self.category_cols]=test_X[self.category_cols].astype('string')
+        else:
+            test_X[self.category_cols]=test_X[self.category_cols].astype('category')
+        for idx in range(0,len(test_X),self.infer_size):
+            if 'tabnet' in str(type(model)):
+                for c in self.category_cols:
+                   test_X[c]=test_X[c].apply(lambda x:int(x)).astype(np.int32)     
+                test_preds[idx:idx+self.infer_size]=model.predict(test_X[idx:idx+self.infer_size].to_numpy()).reshape(-1)
+            else:   
+                test_preds[idx:idx+self.infer_size]=model.predict(test_X[idx:idx+self.infer_size])  
+        
+        if self.use_TTA:
+            test_aug_X=self.pca_augmentation(X=test_X)
+            test_aug_preds=np.zeros((len(test_aug_X)))
+            if 'catboost' in str(type(model)):#catboost
+                test_aug_X[self.category_cols]=test_aug_X[self.category_cols].astype('string')
+            else:
+                test_aug_X[self.category_cols]=test_aug_X[self.category_cols].astype('category')
+            for idx in range(0,len(test_aug_X),self.infer_size):
+                if 'tabnet' in str(type(model)):
+                    for c in self.category_cols:
+                       test_aug_X[c]=test_aug_X[c].apply(lambda x:int(x)).astype(np.int32)     
+                    test_aug_preds[idx:idx+self.infer_size]=model.predict(test_aug_X[idx:idx+self.infer_size].to_numpy()).reshape(-1)
+                else:   
+                    test_aug_preds[idx:idx+self.infer_size]=model.predict(test_aug_X[idx:idx+self.infer_size])  
+            test_preds=(test_preds+test_aug_preds)/2
+        
+        return test_preds
+
+    #classification
+    def predict_proba_batch(self,model,test_X):
+        test_preds=np.zeros((len(test_X),self.num_classes))
+        if 'catboost' in str(type(model)):#catboost
+            test_X[self.category_cols]=test_X[self.category_cols].astype('string')
+        else:
+            test_X[self.category_cols]=test_X[self.category_cols].astype('category')
+        for idx in range(0,len(test_X),self.infer_size):
+            if 'tabnet' in str(type(model)):
+                for c in self.category_cols:
+                    test_X[c]=test_X[c].apply(lambda x:int(x)).astype(np.int32)     
+                test_preds[idx:idx+self.infer_size]=model.predict_proba(test_X[idx:idx+self.infer_size].to_numpy())
+            else:
+                test_preds[idx:idx+self.infer_size]=model.predict_proba(test_X[idx:idx+self.infer_size])
+        
+        if self.use_TTA:
+            test_aug_X=self.pca_augmentation(X=test_X)
+            test_aug_preds=np.zeros((len(test_aug_X),self.num_classes))
+            if 'catboost' in str(type(model)):#catboost
+                test_aug_X[self.category_cols]=test_aug_X[self.category_cols].astype('string')
+            else:
+                test_aug_X[self.category_cols]=test_aug_X[self.category_cols].astype('category')
+            for idx in range(0,len(test_aug_X),self.infer_size):
+                if 'tabnet' in str(type(model)):
+                    for c in self.category_cols:
+                       test_aug_X[c]=test_aug_X[c].apply(lambda x:int(x)).astype(np.int32)     
+                    test_aug_preds[idx:idx+self.infer_size]=model.predict_proba(test_aug_X[idx:idx+self.infer_size].to_numpy())
+                else:   
+                    test_aug_preds[idx:idx+self.infer_size]=model.predict_proba(test_aug_X[idx:idx+self.infer_size])  
+            test_preds=(test_preds+test_aug_preds)/2
+        
+        return test_preds
+    
+    def predict(self,test_path_or_file:str|pd.DataFrame|pl.DataFrame='test.csv',weights=np.zeros(0))->np.array:
+        if self.objective=='regression':
+            self.PrintColor("predict......",color=Fore.GREEN)
+            #weights:[1]*len(self.models)
+            n=len(self.models)
+            #if you don't set weights,then calculate mean value as result.
+            if len(weights)==0:
+                weights=np.ones(n)
+            if len(weights)!=n:
+                raise ValueError(f"length of weights must be {len(self.models)}.")
+            self.PrintColor("weight normalization")
+            weights=np.array([w for w in weights for f in range(self.num_folds) for r in range(self.n_repeats)],dtype=np.float32)
+            #normalization
+            weights=weights*(self.num_folds*self.n_repeats*n)/np.sum(weights)
+    
+            #calculate oof score if save_oof_preds
+            self.cal_final_score(weights)
+            self.PrintColor("load test data")
+            self.test=self.load_data(test_path_or_file,mode='test')
+            #process date_cols
+            for date_col in self.date_cols:
+                self.test[date_col]=pd.to_datetime(self.test[date_col])
+                self.test[date_col]=(self.test[date_col]-pd.to_datetime('1970-01-01')).dt.total_seconds()
+                self.test=self.construct_seasonal_feature(self.test,date_col,timestep='day')
+            self.test.drop(self.date_cols,axis=1,inplace=True)
+            
+            self.PrintColor("Feature Engineer")
+            self.test=self.base_FE(self.test,mode='test',drop_cols=self.drop_cols)
+            self.test=self.test.drop([self.group_col,self.target_col],axis=1,errors='ignore')
+            self.test.columns=self.colname_clean(list(self.test.columns))
+            print(f"test.shape:{self.test.shape}")
+            self.PrintColor("prediction on test data")
+            test_preds=np.zeros((len(self.models)*self.n_repeats,len(self.test)))
+            for idx in range(len(self.trained_models)): 
+                test_copy=self.CV_stat(X=self.test.copy(),fold=idx%self.num_folds,repeat=idx//(len(self.models)*self.num_folds)  )
+                test_copy=self.CV_FE(test_copy,mode='test',fold=idx%self.num_folds,repeat=idx//(len(self.models)*self.num_folds)  )
+                try:
+                    test_pred=self.predict_batch(model=self.trained_models[idx],test_X=test_copy)
+                except:#catboost
+                    test_copy[self.category_cols]=test_copy[self.category_cols].astype('string')
+                    test_pred=self.predict_batch(model=self.trained_models[idx],test_X=test_copy)
+                if self.use_CIR:
+                    test_pred=self.trained_CIR[idx//self.num_folds].transform(test_pred)
+                
+                test_preds[idx//self.num_folds]+=test_pred
+                if idx%self.num_folds==self.num_folds-1:
+                    test_preds[idx//self.num_folds]/=self.num_folds
+                    
+                if self.use_oof_as_feature and idx%self.num_folds==self.num_folds-1:
+                    self.test[f'{self.models[idx//self.num_folds%len(self.models)][1]}_seed{self.seed}_repeat{idx//(len(self.models)*self.num_folds )}_fold{self.num_folds}_oof_preds']=test_preds[idx//self.num_folds]
+                    
+            if self.save_test_preds:
+                np.save(self.model_save_path+f'_{self.target_col}_test_preds.npy',test_preds)
+            if self.use_median_as_pred:
+                test_preds=np.median(test_preds,axis=0)
+            else:
+                test_preds=np.mean([test_preds[i]*weights[i] for i in range(len(test_preds))],axis=0)
+            
+            #use pseudo label
+            if self.use_pseudo_label:
+                self.test[self.target_col]=test_preds
+                self.trained_models=[]
+                self.trained_CIR=[]
+                self.fit(self.train_path_or_file,self.category_cols,
+                     self.date_cols)
+                #calculate oof score if save_oof_preds
+                self.cal_final_score(weights)
+                
+                test_preds=np.zeros((len(self.models)*self.n_repeats,len(self.test)))
+                for idx in range(len(self.trained_models)):
+                    test_copy=self.CV_stat(X=self.test.copy(),fold=idx%self.num_folds,repeat=idx//(len(self.models)*self.num_folds)  )
+                    test_copy=self.CV_FE(test_copy,mode='test',fold=idx%self.num_folds,repeat=idx//(len(self.models)*self.num_folds))
+                    try:
+                        test_pred=self.predict_batch(model=self.trained_models[idx],test_X=test_copy.drop([self.target_col],axis=1))
+                    except:
+                        test_copy[self.category_cols]=test_copy[self.category_cols].astype('string')
+                        test_pred=self.predict_batch(model=self.trained_models[idx],test_X=test_copy.drop([self.target_col],axis=1))
+                    
+                    test_preds[idx//self.num_folds]+=test_pred
+                    if idx%self.num_folds==self.num_folds-1:
+                        test_preds[idx//self.num_folds]/=self.num_folds
+                
+                if self.save_test_preds:
+                    np.save(self.model_save_path+f'_{self.target_col}_test_preds.npy',test_preds)
+                if self.use_median_as_pred:
+                    test_preds=np.median(test_preds,axis=0)
+                else:
+                    test_preds=np.mean([test_preds[i]*weights[i] for i in range(len(test_preds))],axis=0)
+            if self.exp_mode:
+                test_preds=np.expm1(test_preds)-self.exp_mode_b       
+            return test_preds
+        else:#classification 
+            #(len(self.test),self.num_classes)
+            test_preds=self.predict_proba(test_path_or_file,weights)
+            if 'auc' in self.metric:
+                return test_preds[:,1]
+            else:
+                return np.argmax(test_preds,axis=1)          
+
+    def predict_proba(self,test_path_or_file:str|pd.DataFrame|pl.DataFrame='test.csv',weights=np.zeros(0))->np.array:
+        self.PrintColor("predict......",color=Fore.GREEN)
+        #weights:[1]*len(self.models)
+        n=len(self.models)
+        #if you don't set weights,then calculate mean value as result.
+        if len(weights)==0:
+            weights=np.ones(n)
+        if len(weights)!=n:
+            raise ValueError(f"length of weights must be {len(self.models)}.")
+        self.PrintColor("weight normalization")
+        weights=np.array([w for w in weights for f in range(self.num_folds) for r in range(self.n_repeats)],dtype=np.float32)
+        #normalization
+        weights=weights*(self.num_folds*self.n_repeats*n)/np.sum(weights)
+
+        #calculate oof score if save_oof_preds
+        self.cal_final_score(weights)
+        
+        self.PrintColor("load test data")
+        self.test=self.load_data(test_path_or_file,mode='test')
+        #process date_cols
+        for date_col in self.date_cols:
+            self.test[date_col]=pd.to_datetime(self.test[date_col])
+            self.test[date_col]=(self.test[date_col]-pd.to_datetime('1970-01-01')).dt.total_seconds()
+            self.test=self.construct_seasonal_feature(self.test,date_col,timestep='day')
+        self.test.drop(self.date_cols,axis=1,inplace=True)
+        
+        self.PrintColor("Feature Engineer")
+        self.test=self.base_FE(self.test,mode='test',drop_cols=self.drop_cols)
+        self.test=self.test.drop([self.group_col,self.target_col],axis=1,errors='ignore')
+        self.test.columns=self.colname_clean(list(self.test.columns))
+        print(f"test.shape:{self.test.shape}")
+        self.PrintColor("prediction on test data")
+        test_preds=np.zeros((len(self.models)*self.n_repeats,len(self.test),self.num_classes))
+        for idx in range(len(self.trained_models)):
+            test_copy=self.CV_stat(X=self.test.copy(),fold=idx%self.num_folds,repeat=idx//(len(self.models)*self.num_folds)  )
+            test_copy=self.CV_FE(test_copy,mode='test',fold=idx%self.num_folds,repeat=idx//(len(self.models)*self.num_folds))
+            try:
+                test_pred=self.predict_proba_batch(model=self.trained_models[idx],test_X=test_copy)
+            except:
+                test_copy[self.category_cols]=test_copy[self.category_cols].astype('string')
+                test_pred=self.predict_proba_batch(model=self.trained_models[idx],test_X=test_copy)
+            
+            test_preds[idx//self.num_folds]+=test_pred
+            if idx%self.num_folds==self.num_folds-1:
+                test_preds[idx//self.num_folds]/=self.num_folds
+            if self.use_oof_as_feature and idx%self.num_folds==self.num_folds-1:
+                for c in range(self.num_classes):
+                    self.test[f'{self.models[idx//self.num_folds%len(self.models)][1]}_seed{self.seed}_repeat{idx//(len(self.models)*self.num_folds )}_fold{self.num_folds}_oof_preds_class{c}']=test_preds[idx//self.num_folds][:,c]
+                    
+        if self.save_test_preds:
+            np.save(self.model_save_path+f'_{self.target_col}_test_preds.npy',test_preds)
+        test_preds=np.mean([test_preds[i]*weights[i] for i in range(len(test_preds))],axis=0)#(len(test),self.num_classes)
+        
+        #use pseudo label
+        if self.use_pseudo_label:
+            self.test[self.target_col]=np.argmax(test_preds,axis=1)
+            self.trained_models=[]
+            self.fit(self.train_path_or_file,self.category_cols,
+                     self.date_cols,self.target2idx)
+            #calculate oof score if save_oof_preds
+            self.cal_final_score(weights)
+            test_preds=np.zeros((len(self.models)*self.n_repeats,len(self.test),self.num_classes))
+            for idx in range(len(self.trained_models)):
+                test_copy=self.CV_stat(X=self.test.copy(),fold=idx%self.num_folds,repeat=idx//(len(self.models)*self.num_folds)  )
+                test_copy=self.CV_FE(test_copy,mode='test',fold=idx%self.num_folds, repeat=idx//(len(self.models)*self.num_folds))
+                try:
+                    test_pred=self.predict_proba_batch(model=self.trained_models[idx],test_X=test_copy.drop([self.target_col],axis=1))
+                except:
+                    test_copy[self.category_cols]=test_copy[self.category_cols].astype('string')
+                    test_pred=self.predict_proba_batch(model=self.trained_models[idx],test_X=test_copy.drop([self.target_col],axis=1))
+                test_preds[idx//self.num_folds]+=test_pred
+                if idx%self.num_folds==self.num_folds-1:
+                    test_preds[idx//self.num_folds]/=self.num_folds
+                
+            if self.save_test_preds:
+                np.save(self.model_save_path+f'_{self.target_col}_test_preds.npy',test_preds)
+            test_preds=np.mean([test_preds[i]*weights[i] for i in range(len(test_preds))],axis=0)
+        self.PrintColor(f"idx2target={self.idx2target}",color=Fore.RED)
+        self.pickle_dump(self.idx2target,self.model_save_path+f'_{self.target_col}_idx2target.pkl')
+        
+        return test_preds        
+        
+    #ensemble some solutions.
+    def ensemble(self,solution_paths_or_files:list[str]=[],weights=None):
+        #If you don't set weights,then use mean value as result.
+        n=len(solution_paths_or_files)
+        if weights==None:
+            weights=np.ones(n)
+        if len(weights)!=n:
+            raise ValueError(f"length of weights must be len(solution_paths_or_files).")
+        #normalization
+        weights=weights/np.sum(weights)
+
+        #Weighted Sum of Continuous Values
+        if (self.objective=='regression') or(self.metric=='auc'):
+            final_solutions=[]
+            for i in range(n):
+                if type(solution_paths_or_files[i])==str:#csv file path
+                    try:
+                        solution=pl.read_csv(solution_paths_or_files[i])
+                        solution=solution.to_pandas()
+                    except:
+                        raise ValueError("Zeffy can only support csv file.")
+                else:#csv_file have load
+                    solution=solution_paths_or_files[i].copy()
+                if not isinstance(solution, pd.DataFrame):
+                    raise ValueError("solution_paths_or_files is not pd.DataFrame.")
+                final_solutions.append(weights[i]*solution[self.target_col].values)
+            final_solutions=np.sum(final_solutions,axis=0)
+            return final_solutions
+        else:#classification find mode
+            #n solutions,m datas
+            solutions=[]
+            for i in range(n):
+                if type(solution_paths_or_files[i])==str:
+                    try:
+                        solution=pl.read_csv(solution_paths_or_files[i])
+                        solution=solution.to_pandas()
+                    except:
+                        raise ValueError("Zeffy can only support csv file.")
+                else:#csv_file have load
+                    solution=solution_paths_or_files[i].copy()
+                if not isinstance(solution, pd.DataFrame):
+                    raise ValueError("solution_paths_or_files is not pd.DataFrame.")
+                solutions.append(solution[self.target_col].values)
+            final_solutions=[]
+            for i in range(len(solutions[0])):
+                solution2count={}
+                #data[i] solution[j]
+                for j in range(n):
+                    if solutions[j][i] in solution2count.keys():
+                        solution2count[ solutions[j][i] ]+=weights[j]
+                    else:
+                        solution2count[ solutions[j][i] ]=weights[j]
+                solution2count=dict(sorted(solution2count.items(),key=lambda x:-x[1]))
+                final_solutions.append(list(solution2count.keys())[0])
+            final_solutions=np.array(final_solutions)
+            return final_solutions
+
+    #save test_preds to submission.csv
+    def submit(self,submission_path_or_file:str|pd.DataFrame='submission.csv',
+               test_preds:np.array=np.ones(3),save_name:str='Zeffy'):
+        """
+        submission_path_or_file  :Usually it is a submittion.csv file.
+        test_preds               :The prediction results of the model on the test data.
+        save_name                :A string,if save_name='subsmission',then you will
+                                  get a submittion.csv file.
+        """
+        self.PrintColor('submission......',color = Fore.GREEN)
+        submission=self.load_data(submission_path_or_file,mode='submission')
+        submission[self.target_col]=test_preds
+        if self.objective!='regression':
+            #auc and your custom auc metric
+            if 'auc' not in self.metric:
+                submission[self.target_col]=submission[self.target_col].apply(lambda x:self.idx2target[x])
+        #deal with bool.
+        if 'auc'  not in self.metric:
+            submission[self.target_col]=submission[self.target_col].astype(self.target_dtype)
+        submission.to_csv(f"{save_name}.csv",index=None)
